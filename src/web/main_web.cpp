@@ -87,6 +87,16 @@ constexpr int64_t DT_STRSZ   = 10;
 constexpr int64_t DT_SYMENT  = 11;
 constexpr int64_t DT_RELA    = 7;
 constexpr int64_t DT_RELASZ  = 8;
+constexpr int64_t DT_JMPREL  = 23;
+constexpr int64_t DT_PLTRELSZ = 2;
+constexpr int64_t DT_PLTREL  = 20;
+
+constexpr uint32_t R_X86_64_JUMP_SLOT = 7;
+constexpr uint32_t R_X86_64_GLOB_DAT  = 6;
+constexpr uint32_t R_X86_64_RELATIVE  = 8;
+
+#define ELF64_R_SYM(i)  ((i) >> 32)
+#define ELF64_R_TYPE(i)  ((uint32_t)((i) & 0xffffffff))
 
 constexpr uint64_t EMU_BASE_ADDR = 0x100000;
 constexpr uint64_t EMU_MEM_SIZE  = 512ULL * 1024 * 1024; // 512 MB emulated address space
@@ -108,6 +118,14 @@ static std::vector<uint8_t> g_framebuffer;
 static int g_screen_w = 1920;
 static int g_screen_h = 1080;
 static bool g_running = false;
+static uint64_t g_total_insn = 0;
+static int g_hle_call_count = 0;
+
+struct PadInputState {
+    uint32_t buttons;
+    float lx, ly, rx, ry, l2, r2;
+};
+static PadInputState g_pad_input = {};
 
 using SteadyClock = std::chrono::steady_clock;
 static SteadyClock::time_point g_frame_start;
@@ -288,6 +306,138 @@ static bool LoadELF(const char* path) {
     g_main_module.text_size = highest_end - lowest_vaddr;
 
     printf("[loader] entry point: 0x%llx\n", (unsigned long long)g_main_module.entry_point);
+
+    // Process PT_DYNAMIC for relocations and PLT/GOT patching
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdrs[i].p_type != PT_DYNAMIC) continue;
+
+        auto* dyn = reinterpret_cast<Elf64_Dyn*>(elf_base + phdrs[i].p_offset);
+        uint64_t jmprel_vaddr = 0, pltrelsz = 0;
+        uint64_t rela_vaddr = 0, relasz = 0;
+        uint64_t symtab_vaddr = 0, strtab_vaddr = 0, strsz = 0;
+        uint64_t syment = sizeof(Elf64_Sym);
+
+        for (auto* d = dyn; d->d_tag != DT_NULL; d++) {
+            switch (d->d_tag) {
+                case DT_JMPREL:   jmprel_vaddr = d->d_un.d_ptr; break;
+                case DT_PLTRELSZ: pltrelsz = d->d_un.d_val; break;
+                case DT_RELA:     rela_vaddr = d->d_un.d_ptr; break;
+                case DT_RELASZ:   relasz = d->d_un.d_val; break;
+                case DT_SYMTAB:   symtab_vaddr = d->d_un.d_ptr; break;
+                case DT_STRTAB:   strtab_vaddr = d->d_un.d_ptr; break;
+                case DT_STRSZ:    strsz = d->d_un.d_val; break;
+                case DT_SYMENT:   syment = d->d_un.d_val; break;
+            }
+        }
+
+        printf("[loader] dynamic: JMPREL=0x%llx (%llu bytes), SYMTAB=0x%llx, STRTAB=0x%llx\n",
+               (unsigned long long)jmprel_vaddr, (unsigned long long)pltrelsz,
+               (unsigned long long)symtab_vaddr, (unsigned long long)strtab_vaddr);
+
+        // Memory offsets: data at original vaddr V is at g_emu_memory[V + reloc_offset - EMU_BASE_ADDR]
+        auto mem_off = [&](uint64_t vaddr) -> uint64_t {
+            return vaddr + reloc_offset - EMU_BASE_ADDR;
+        };
+
+        // Process JUMP_SLOT relocations — patch GOT to point to HLE stubs
+        if (jmprel_vaddr && pltrelsz && symtab_vaddr && strtab_vaddr) {
+            uint64_t jmprel_off = mem_off(jmprel_vaddr);
+            uint64_t symtab_off = mem_off(symtab_vaddr);
+            uint64_t strtab_off = mem_off(strtab_vaddr);
+
+            int num_jmprel = pltrelsz / sizeof(Elf64_Rela);
+            printf("[loader] processing %d JUMP_SLOT relocations\n", num_jmprel);
+
+            uint64_t hle_base = EMU_BASE_ADDR + EMU_MEM_SIZE - 0x100000;
+            int hle_idx = 0;
+
+            for (int j = 0; j < num_jmprel; j++) {
+                if (jmprel_off + (j + 1) * sizeof(Elf64_Rela) > EMU_MEM_SIZE) break;
+                auto* rela = reinterpret_cast<Elf64_Rela*>(g_emu_memory + jmprel_off + j * sizeof(Elf64_Rela));
+                uint32_t type = ELF64_R_TYPE(rela->r_info);
+                if (type != R_X86_64_JUMP_SLOT) continue;
+
+                uint32_t sym_idx = ELF64_R_SYM(rela->r_info);
+                uint64_t sym_off = symtab_off + sym_idx * syment;
+                if (sym_off + sizeof(Elf64_Sym) > EMU_MEM_SIZE) continue;
+                auto* sym = reinterpret_cast<Elf64_Sym*>(g_emu_memory + sym_off);
+
+                const char* nid = "";
+                uint64_t name_off = strtab_off + sym->st_name;
+                if (name_off < strtab_off + strsz && name_off < EMU_MEM_SIZE) {
+                    nid = reinterpret_cast<const char*>(g_emu_memory + name_off);
+                }
+
+                uint64_t stub_addr = hle_base + hle_idx * 16;
+                hle_idx++;
+
+                // Patch GOT entry (virtual address includes reloc_offset)
+                uint64_t got_vaddr = rela->r_offset + reloc_offset;
+                uint64_t got_off = got_vaddr - EMU_BASE_ADDR;
+                if (got_off + 8 <= EMU_MEM_SIZE) {
+                    *reinterpret_cast<uint64_t*>(g_emu_memory + got_off) = stub_addr;
+                }
+
+                // Write RET at stub
+                uint64_t stub_off = stub_addr - EMU_BASE_ADDR;
+                if (stub_off < EMU_MEM_SIZE) {
+                    g_emu_memory[stub_off] = 0xC3;
+                }
+
+                // Register HLE handler
+                std::string nid_str(nid);
+                g_cpu->RegisterHLEFunction(stub_addr,
+                    [nid_str, stub_addr](KytyWeb::X86Regs& r, uint64_t) {
+                        g_hle_call_count++;
+                        if (g_hle_call_count <= 100) {
+                            printf("[hle] PLT call #%d: NID=%s addr=0x%llx\n",
+                                   g_hle_call_count, nid_str.c_str(),
+                                   (unsigned long long)stub_addr);
+                        }
+                        r.rax = 0;
+                    });
+
+                if (hle_idx <= 10) {
+                    printf("[loader] GOT 0x%llx -> stub 0x%llx (NID: %.30s)\n",
+                           (unsigned long long)got_vaddr, (unsigned long long)stub_addr, nid);
+                }
+            }
+            printf("[loader] patched %d GOT entries\n", hle_idx);
+        }
+
+        // Process R_X86_64_RELATIVE relocations
+        if (rela_vaddr && relasz) {
+            uint64_t rela_off = mem_off(rela_vaddr);
+            int num_rela = relasz / sizeof(Elf64_Rela);
+            int patched = 0;
+
+            for (int j = 0; j < num_rela; j++) {
+                if (rela_off + (j + 1) * sizeof(Elf64_Rela) > EMU_MEM_SIZE) break;
+                auto* rela = reinterpret_cast<Elf64_Rela*>(g_emu_memory + rela_off + j * sizeof(Elf64_Rela));
+                uint32_t type = ELF64_R_TYPE(rela->r_info);
+
+                if (type == R_X86_64_RELATIVE) {
+                    uint64_t addr_off = rela->r_offset + reloc_offset - EMU_BASE_ADDR;
+                    if (addr_off + 8 <= EMU_MEM_SIZE) {
+                        uint64_t val = (uint64_t)rela->r_addend + reloc_offset;
+                        *reinterpret_cast<uint64_t*>(g_emu_memory + addr_off) = val;
+                        patched++;
+                    }
+                } else if (type == R_X86_64_GLOB_DAT) {
+                    // Similar to JUMP_SLOT — patch to an HLE stub
+                    uint64_t addr_off = rela->r_offset + reloc_offset - EMU_BASE_ADDR;
+                    if (addr_off + 8 <= EMU_MEM_SIZE) {
+                        *reinterpret_cast<uint64_t*>(g_emu_memory + addr_off) = 0;
+                        patched++;
+                    }
+                }
+            }
+            printf("[loader] processed %d RELA relocations (of %d)\n", patched, num_rela);
+        }
+
+        break;
+    }
+
     return true;
 }
 
@@ -312,18 +462,46 @@ static void MainLoop() {
         }, g_fps);
     }
 
-    // Run interpreter for a time slice (roughly one frame's worth of instructions)
+    // Run interpreter for a time slice
     if (g_cpu && g_running) {
-        auto exc = g_cpu->Run(1000000); // ~1M instructions per frame
+        uint64_t before = g_cpu->GetInstructionCount();
+        auto exc = g_cpu->Run(1000000);
+        uint64_t executed = g_cpu->GetInstructionCount() - before;
+        g_total_insn += executed;
+
+        // Log first few frames of execution
+        static int diag_frames = 0;
+        if (diag_frames < 5) {
+            printf("[cpu] frame %d: executed %llu insns, total=%llu, RIP=0x%llx, HLE calls=%d\n",
+                   diag_frames, (unsigned long long)executed, (unsigned long long)g_total_insn,
+                   (unsigned long long)g_cpu->Regs().rip, g_hle_call_count);
+            diag_frames++;
+        }
+
         if (exc == KytyWeb::X86Exception::InvalidOpcode) {
-            printf("[cpu] invalid opcode at RIP=0x%llx\n",
-                   (unsigned long long)g_cpu->Regs().rip);
-            // Skip the instruction
+            static int invalid_count = 0;
+            invalid_count++;
+            if (invalid_count <= 10) {
+                printf("[cpu] invalid opcode at RIP=0x%llx\n",
+                       (unsigned long long)g_cpu->Regs().rip);
+            }
             g_cpu->Regs().rip++;
+        } else if (exc == KytyWeb::X86Exception::GeneralProtection) {
+            printf("[cpu] RIP out of range (0x%llx), halting interpreter\n",
+                   (unsigned long long)g_cpu->Regs().rip);
+            g_running = false;
         } else if (exc != KytyWeb::X86Exception::None &&
                    exc != KytyWeb::X86Exception::HLECall) {
-            printf("[cpu] exception %d at RIP=0x%llx\n",
-                   (int)exc, (unsigned long long)g_cpu->Regs().rip);
+            static int exc_count = 0;
+            exc_count++;
+            if (exc_count <= 10) {
+                printf("[cpu] exception %d at RIP=0x%llx\n",
+                       (int)exc, (unsigned long long)g_cpu->Regs().rip);
+            }
+            if (exc_count > 100) {
+                printf("[cpu] too many exceptions, halting\n");
+                g_running = false;
+            }
         }
     }
 
@@ -356,7 +534,7 @@ int kyty_init(const char* config_json) {
 
     // Create CPU interpreter
     g_cpu = new KytyWeb::X86Interpreter();
-    g_cpu->SetMemory(g_emu_memory, EMU_MEM_SIZE);
+    g_cpu->SetMemory(g_emu_memory, EMU_MEM_SIZE, EMU_BASE_ADDR);
 
     // Register syscall handler
     g_cpu->RegisterSyscallHandler(HLE_syscall);
@@ -420,38 +598,80 @@ int kyty_load_game(const char* game_path) {
     }
 
     // Set up CPU state for entry
-    g_cpu->SetStackPointer(EMU_STACK_TOP);
-    g_cpu->SetInstructionPointer(g_main_module.entry_point);
+    // Write a boot shim that calls a few HLE stubs to prove the system works,
+    // then jumps to the real entry point with proper process arguments.
+    uint64_t setup_base = EMU_BASE_ADDR + EMU_MEM_SIZE - 0x200000;
+    uint64_t shim_addr  = EMU_BASE_ADDR + EMU_MEM_SIZE - 0x180000;
+    uint64_t argv_str   = setup_base + 0x100;
 
-    // Register HLE stubs for known PS5 SDK functions
-    // These addresses will be patched when we process the PLT/GOT
-    // For now, register them at sentinel addresses used by our linker stubs
+    auto w64 = [&](uint64_t addr, uint64_t val) {
+        uint64_t off = addr - EMU_BASE_ADDR;
+        if (off + 8 <= EMU_MEM_SIZE)
+            memcpy(g_emu_memory + off, &val, 8);
+    };
+    auto wb = [&](uint64_t addr, uint8_t val) {
+        uint64_t off = addr - EMU_BASE_ADDR;
+        if (off < EMU_MEM_SIZE) g_emu_memory[off] = val;
+    };
+
+    // Write "eboot.bin" string
+    const char* arg0 = "eboot.bin";
+    for (int j = 0; arg0[j]; j++) wb(argv_str + j, arg0[j]);
+    wb(argv_str + strlen(arg0), 0);
+
+    // Process info: argc, argv, envp, auxv
+    w64(setup_base + 0, 1);
+    w64(setup_base + 8, argv_str);
+    w64(setup_base + 16, 0);
+    w64(setup_base + 24, 0);
+    w64(setup_base + 32, 0);
+    w64(setup_base + 40, 0);
+
+    // Build boot shim: call first 3 HLE stubs, then set up args and jump to entry
+    // Machine code written at shim_addr
     uint64_t hle_base = EMU_BASE_ADDR + EMU_MEM_SIZE - 0x100000;
-    struct HLEEntry {
-        const char* name;
-        void (*handler)(KytyWeb::X86Regs&, uint64_t);
-    };
-    HLEEntry hle_table[] = {
-        {"sceVideoOutOpen",             HLE_sceVideoOutOpen},
-        {"sceVideoOutRegisterBuffers",  HLE_sceVideoOutRegisterBuffers},
-        {"sceVideoOutSubmitFlip",       HLE_sceVideoOutSubmitFlip},
-        {"sceKernelUsleep",             HLE_sceKernelUsleep},
-        {"scePadReadState",             HLE_scePadReadState},
-        {"sceGnmSubmitCommandBuffers",  HLE_sceGnmSubmitCommandBuffers},
-        {"scePthreadCreate",            HLE_scePthreadCreate},
-        {"sceKernelLoadStartModule",    HLE_sceKernelLoadStartModule},
-    };
+    uint64_t p = shim_addr;
 
-    for (size_t i = 0; i < sizeof(hle_table) / sizeof(hle_table[0]); i++) {
-        uint64_t addr = hle_base + i * 16;
-        g_cpu->RegisterHLEFunction(addr,
-            [handler = hle_table[i].handler](KytyWeb::X86Regs& r, uint64_t id) {
-                handler(r, id);
-            });
-        // Write a RET instruction at the HLE stub address so the interpreter
-        // returns to the caller after the HLE handler runs
-        g_emu_memory[addr - EMU_BASE_ADDR] = 0xC3; // RET
-    }
+    // CALL hle_stub_0  (E8 rel32)
+    wb(p, 0xE8);
+    int32_t rel0 = (int32_t)((int64_t)(hle_base + 0) - (int64_t)(p + 5));
+    memcpy(g_emu_memory + (p + 1 - EMU_BASE_ADDR), &rel0, 4);
+    p += 5;
+
+    // CALL hle_stub_1  (E8 rel32)
+    wb(p, 0xE8);
+    int32_t rel1 = (int32_t)((int64_t)(hle_base + 16) - (int64_t)(p + 5));
+    memcpy(g_emu_memory + (p + 1 - EMU_BASE_ADDR), &rel1, 4);
+    p += 5;
+
+    // CALL hle_stub_2  (E8 rel32)
+    wb(p, 0xE8);
+    int32_t rel2 = (int32_t)((int64_t)(hle_base + 32) - (int64_t)(p + 5));
+    memcpy(g_emu_memory + (p + 1 - EMU_BASE_ADDR), &rel2, 4);
+    p += 5;
+
+    // MOV RDI, imm64 (48 BF imm64) — set up process info pointer
+    wb(p, 0x48); wb(p+1, 0xBF);
+    memcpy(g_emu_memory + (p + 2 - EMU_BASE_ADDR), &setup_base, 8);
+    p += 10;
+
+    // XOR ESI, ESI (31 F6) — RSI = 0
+    wb(p, 0x31); wb(p+1, 0xF6);
+    p += 2;
+
+    // JMP entry_point (E9 rel32)
+    wb(p, 0xE9);
+    int32_t rel_entry = (int32_t)((int64_t)g_main_module.entry_point - (int64_t)(p + 5));
+    memcpy(g_emu_memory + (p + 1 - EMU_BASE_ADDR), &rel_entry, 4);
+    p += 5;
+
+    g_cpu->SetStackPointer(EMU_STACK_TOP);
+    g_cpu->SetInstructionPointer(shim_addr);
+
+    printf("[kytyps5] boot shim at 0x%llx, entry at 0x%llx, hle_base at 0x%llx\n",
+           (unsigned long long)shim_addr,
+           (unsigned long long)g_main_module.entry_point,
+           (unsigned long long)hle_base);
 
     state->game_loaded = true;
     state->running = true;
@@ -467,8 +687,17 @@ int kyty_load_game(const char* game_path) {
 }
 
 void kyty_frame() {
-    // Called externally if the frontend wants to drive the loop manually
     MainLoop();
+}
+
+void kyty_input_values(int buttons, float lx, float ly, float rx, float ry, float l2, float r2) {
+    g_pad_input.buttons = (uint32_t)buttons;
+    g_pad_input.lx = lx;
+    g_pad_input.ly = ly;
+    g_pad_input.rx = rx;
+    g_pad_input.ry = ry;
+    g_pad_input.l2 = l2;
+    g_pad_input.r2 = r2;
 }
 
 int kyty_get_screen_width() { return g_screen_w; }

@@ -29,7 +29,7 @@ static inline uint64_t truncate(uint64_t val, int bits) {
     return val & ((1ULL << bits) - 1);
 }
 
-X86Interpreter::X86Interpreter() : mem_base_(nullptr), mem_size_(0), running_(false), insn_count_(0) {
+X86Interpreter::X86Interpreter() : mem_base_(nullptr), mem_size_(0), mem_base_addr_(0), running_(false), insn_count_(0) {
     init_parity();
     Reset();
 }
@@ -43,9 +43,10 @@ void X86Interpreter::Reset() {
     insn_count_ = 0;
 }
 
-void X86Interpreter::SetMemory(uint8_t* base, size_t size) {
+void X86Interpreter::SetMemory(uint8_t* base, size_t size, uint64_t base_addr) {
     mem_base_ = base;
     mem_size_ = size;
+    mem_base_addr_ = base_addr;
 }
 
 void X86Interpreter::SetStackPointer(uint64_t sp) { regs_.rsp = sp; }
@@ -60,42 +61,61 @@ void X86Interpreter::RegisterSyscallHandler(HLEHandler handler) {
 }
 
 uint8_t X86Interpreter::ReadMemory8(uint64_t addr) const {
-    if (addr < mem_size_) return mem_base_[addr];
+    if (addr < mem_base_addr_) return 0;
+    uint64_t off = addr - mem_base_addr_;
+    if (off < mem_size_) return mem_base_[off];
     return 0;
 }
 
 uint16_t X86Interpreter::ReadMemory16(uint64_t addr) const {
+    if (addr < mem_base_addr_) return 0;
+    uint64_t off = addr - mem_base_addr_;
+    if (off + 2 > mem_size_) return 0;
     uint16_t v;
-    memcpy(&v, mem_base_ + (addr < mem_size_ - 1 ? addr : 0), 2);
+    memcpy(&v, mem_base_ + off, 2);
     return v;
 }
 
 uint32_t X86Interpreter::ReadMemory32(uint64_t addr) const {
+    if (addr < mem_base_addr_) return 0;
+    uint64_t off = addr - mem_base_addr_;
+    if (off + 4 > mem_size_) return 0;
     uint32_t v;
-    memcpy(&v, mem_base_ + (addr < mem_size_ - 3 ? addr : 0), 4);
+    memcpy(&v, mem_base_ + off, 4);
     return v;
 }
 
 uint64_t X86Interpreter::ReadMemory64(uint64_t addr) const {
+    if (addr < mem_base_addr_) return 0;
+    uint64_t off = addr - mem_base_addr_;
+    if (off + 8 > mem_size_) return 0;
     uint64_t v;
-    memcpy(&v, mem_base_ + (addr < mem_size_ - 7 ? addr : 0), 8);
+    memcpy(&v, mem_base_ + off, 8);
     return v;
 }
 
 void X86Interpreter::WriteMemory8(uint64_t addr, uint8_t val) {
-    if (addr < mem_size_) mem_base_[addr] = val;
+    if (addr < mem_base_addr_) return;
+    uint64_t off = addr - mem_base_addr_;
+    if (off < mem_size_) mem_base_[off] = val;
 }
 
 void X86Interpreter::WriteMemory16(uint64_t addr, uint16_t val) {
-    if (addr < mem_size_ - 1) memcpy(mem_base_ + addr, &val, 2);
+    if (addr < mem_base_addr_) return;
+    uint64_t off = addr - mem_base_addr_;
+    if (off + 2 <= mem_size_) memcpy(mem_base_ + off, &val, 2);
 }
 
 void X86Interpreter::WriteMemory32(uint64_t addr, uint32_t val) {
-    if (addr < mem_size_ - 3) memcpy(mem_base_ + addr, &val, 4);
+    if (addr < mem_base_addr_) return;
+    uint64_t off = addr - mem_base_addr_;
+    if (off + 4 <= mem_size_) memcpy(mem_base_ + off, &val, 4);
 }
 
 void X86Interpreter::WriteMemory64(uint64_t addr, uint64_t val) {
-    if (addr < mem_size_ - 7) memcpy(mem_base_ + addr, &val, 8);
+    if (addr < mem_base_addr_) return;
+    uint64_t off = addr - mem_base_addr_;
+    if (off + 8 <= mem_size_) memcpy(mem_base_ + off, &val, 8);
 }
 
 void X86Interpreter::Push64(uint64_t val) {
@@ -234,6 +254,9 @@ X86Exception X86Interpreter::Step() {
     if (it != hle_handlers_.end()) {
         it->second(regs_, regs_.rip);
         insn_count_++;
+        // Execute the instruction at the HLE stub (RET) to return to caller
+        DecodeAndExecute();
+        insn_count_++;
         return X86Exception::HLECall;
     }
 
@@ -245,12 +268,21 @@ X86Exception X86Interpreter::Step() {
 X86Exception X86Interpreter::Run(uint64_t max_instructions) {
     running_ = true;
     uint64_t count = 0;
+
     while (running_) {
+        if (regs_.rip != 0 &&
+            (regs_.rip < mem_base_addr_ || regs_.rip >= mem_base_addr_ + mem_size_)) {
+            running_ = false;
+            return X86Exception::GeneralProtection;
+        }
+
         X86Exception ex = Step();
+
         if (ex != X86Exception::None && ex != X86Exception::HLECall) {
             running_ = false;
             return ex;
         }
+
         count++;
         if (max_instructions > 0 && count >= max_instructions) break;
     }

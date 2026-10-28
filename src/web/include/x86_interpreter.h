@@ -52,7 +52,7 @@ public:
     ~X86Interpreter();
 
     void Reset();
-    void SetMemory(uint8_t* base, size_t size);
+    void SetMemory(uint8_t* base, size_t size, uint64_t base_addr = 0);
     void SetStackPointer(uint64_t sp);
     void SetInstructionPointer(uint64_t ip);
 
@@ -109,6 +109,7 @@ private:
     X86Regs regs_;
     uint8_t* mem_base_;
     size_t mem_size_;
+    uint64_t mem_base_addr_;
     bool running_;
     uint64_t insn_count_;
     std::unordered_map<uint64_t, HLEHandler> hle_handlers_;
