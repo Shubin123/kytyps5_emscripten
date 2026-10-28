@@ -83,6 +83,9 @@ public:
 
     uint64_t GetInstructionCount() const { return insn_count_; }
 
+    void SetTraceEnabled(bool enable) { trace_enabled_ = enable; }
+    void SetTraceLimit(int limit) { trace_limit_ = limit; }
+
 private:
     X86Exception DecodeAndExecute();
     void UpdateFlags(uint64_t result, int bits);
@@ -112,6 +115,9 @@ private:
     uint64_t mem_base_addr_;
     bool running_;
     uint64_t insn_count_;
+    bool trace_enabled_ = false;
+    int trace_limit_ = 200;
+    int trace_count_ = 0;
     std::unordered_map<uint64_t, HLEHandler> hle_handlers_;
     HLEHandler syscall_handler_;
 };

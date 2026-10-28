@@ -202,8 +202,50 @@ static void HLE_default(KytyWeb::X86Regs& regs, uint64_t func_id) {
 
 static void HLE_syscall(KytyWeb::X86Regs& regs, uint64_t) {
     uint64_t syscall_num = regs.rax;
-    printf("[hle] syscall %llu\n", (unsigned long long)syscall_num);
-    regs.rax = 0;
+    static int syscall_log_count = 0;
+    if (syscall_log_count < 100) {
+        printf("[hle] syscall %llu (rdi=0x%llx rsi=0x%llx rdx=0x%llx)\n",
+               (unsigned long long)syscall_num,
+               (unsigned long long)regs.rdi,
+               (unsigned long long)regs.rsi,
+               (unsigned long long)regs.rdx);
+        syscall_log_count++;
+    }
+
+    switch (syscall_num) {
+        case 4:   regs.rax = 0; break; // write
+        case 5:   regs.rax = 3; break; // open -> return fd 3
+        case 6:   regs.rax = 0; break; // close
+        case 9: { // mmap
+            // Allocate from emulated address space
+            static uint64_t mmap_top = EMU_BASE_ADDR + 0x10000000;
+            uint64_t size = regs.rsi;
+            if (size == 0) size = 0x1000;
+            size = (size + 0xFFF) & ~0xFFFULL;
+            regs.rax = mmap_top;
+            mmap_top += size;
+            if (mmap_top >= EMU_BASE_ADDR + EMU_MEM_SIZE - 0x200000)
+                mmap_top = EMU_BASE_ADDR + 0x10000000;
+            break;
+        }
+        case 12:  regs.rax = 0; break; // chdir
+        case 20:  regs.rax = 1000; break; // getpid
+        case 54:  regs.rax = 0; break; // ioctl
+        case 73:  regs.rax = 0; break; // munmap
+        case 74:  regs.rax = 0; break; // mprotect
+        case 97:  regs.rax = 0; break; // socket
+        case 165: regs.rax = 0; break; // sysarch (used for TLS setup)
+        case 324: regs.rax = 0; break; // mlock
+        case 477: regs.rax = 0; break; // mmap (FreeBSD 12+)
+        case 557: regs.rax = 0; break; // thr_self
+        case 587: { // sceKernelGetProcParam
+            regs.rax = 0;
+            break;
+        }
+        default:
+            regs.rax = 0;
+            break;
+    }
 }
 
 // ---- ELF loader ----
@@ -471,7 +513,7 @@ static void MainLoop() {
 
         // Log first few frames of execution
         static int diag_frames = 0;
-        if (diag_frames < 5) {
+        if (diag_frames < 20) {
             printf("[cpu] frame %d: executed %llu insns, total=%llu, RIP=0x%llx, HLE calls=%d\n",
                    diag_frames, (unsigned long long)executed, (unsigned long long)g_total_insn,
                    (unsigned long long)g_cpu->Regs().rip, g_hle_call_count);
@@ -481,20 +523,28 @@ static void MainLoop() {
         if (exc == KytyWeb::X86Exception::InvalidOpcode) {
             static int invalid_count = 0;
             invalid_count++;
-            if (invalid_count <= 10) {
-                printf("[cpu] invalid opcode at RIP=0x%llx\n",
-                       (unsigned long long)g_cpu->Regs().rip);
+            if (invalid_count <= 20) {
+                printf("[cpu] invalid opcode at RIP=0x%llx (byte=0x%02x)\n",
+                       (unsigned long long)g_cpu->Regs().rip,
+                       g_cpu->ReadMemory8(g_cpu->Regs().rip));
             }
-            g_cpu->Regs().rip++;
+            if (invalid_count > 500) {
+                printf("[cpu] too many invalid opcodes, halting\n");
+                g_running = false;
+            } else {
+                g_cpu->Regs().rip++;
+            }
         } else if (exc == KytyWeb::X86Exception::GeneralProtection) {
             printf("[cpu] RIP out of range (0x%llx), halting interpreter\n",
                    (unsigned long long)g_cpu->Regs().rip);
             g_running = false;
+        } else if (exc == KytyWeb::X86Exception::Syscall) {
+            // Syscall handled, continue execution
         } else if (exc != KytyWeb::X86Exception::None &&
                    exc != KytyWeb::X86Exception::HLECall) {
             static int exc_count = 0;
             exc_count++;
-            if (exc_count <= 10) {
+            if (exc_count <= 20) {
                 printf("[cpu] exception %d at RIP=0x%llx\n",
                        (int)exc, (unsigned long long)g_cpu->Regs().rip);
             }
@@ -597,12 +647,11 @@ int kyty_load_game(const char* game_path) {
         return -1;
     }
 
-    // Set up CPU state for entry
-    // Write a boot shim that calls a few HLE stubs to prove the system works,
-    // then jumps to the real entry point with proper process arguments.
+    // Set up CPU state for entry — PS5 CRT _start(argc_ptr, cleanup_fn)
+    // RDI points to a SysV-style process param block: [argc, argv[0], NULL, envp..., NULL, auxv...]
+    // RSI = cleanup function pointer (0 = none)
     uint64_t setup_base = EMU_BASE_ADDR + EMU_MEM_SIZE - 0x200000;
-    uint64_t shim_addr  = EMU_BASE_ADDR + EMU_MEM_SIZE - 0x180000;
-    uint64_t argv_str   = setup_base + 0x100;
+    uint64_t argv_str   = setup_base + 0x200;
 
     auto w64 = [&](uint64_t addr, uint64_t val) {
         uint64_t off = addr - EMU_BASE_ADDR;
@@ -614,64 +663,45 @@ int kyty_load_game(const char* game_path) {
         if (off < EMU_MEM_SIZE) g_emu_memory[off] = val;
     };
 
-    // Write "eboot.bin" string
+    // Write "eboot.bin" string for argv[0]
     const char* arg0 = "eboot.bin";
     for (int j = 0; arg0[j]; j++) wb(argv_str + j, arg0[j]);
     wb(argv_str + strlen(arg0), 0);
 
-    // Process info: argc, argv, envp, auxv
-    w64(setup_base + 0, 1);
-    w64(setup_base + 8, argv_str);
-    w64(setup_base + 16, 0);
-    w64(setup_base + 24, 0);
-    w64(setup_base + 32, 0);
+    // Build process param block at setup_base:
+    // [0]  argc = 1
+    // [8]  argv[0] = pointer to "eboot.bin"
+    // [16] NULL (argv terminator)
+    // [24] NULL (envp terminator)
+    // [32] AT_NULL (auxv terminator)
+    w64(setup_base + 0,  1);          // argc
+    w64(setup_base + 8,  argv_str);   // argv[0]
+    w64(setup_base + 16, 0);          // argv NULL
+    w64(setup_base + 24, 0);          // envp NULL
+    w64(setup_base + 32, 0);          // auxv AT_NULL
     w64(setup_base + 40, 0);
 
-    // Build boot shim: call first 3 HLE stubs, then set up args and jump to entry
-    // Machine code written at shim_addr
-    uint64_t hle_base = EMU_BASE_ADDR + EMU_MEM_SIZE - 0x100000;
-    uint64_t p = shim_addr;
+    // Also set up the stack the way _start might expect it:
+    // Some PS5 CRT variants read argc from [RSP] (System V ABI style)
+    uint64_t stack_top = EMU_STACK_TOP;
+    // Push auxv terminator, envp terminator, argv terminator, argv[0], argc
+    stack_top -= 8; w64(stack_top, 0);          // auxv NULL
+    stack_top -= 8; w64(stack_top, 0);          // envp NULL
+    stack_top -= 8; w64(stack_top, 0);          // argv terminator
+    stack_top -= 8; w64(stack_top, argv_str);   // argv[0]
+    stack_top -= 8; w64(stack_top, 1);          // argc
 
-    // CALL hle_stub_0  (E8 rel32)
-    wb(p, 0xE8);
-    int32_t rel0 = (int32_t)((int64_t)(hle_base + 0) - (int64_t)(p + 5));
-    memcpy(g_emu_memory + (p + 1 - EMU_BASE_ADDR), &rel0, 4);
-    p += 5;
+    g_cpu->SetStackPointer(stack_top);
+    g_cpu->SetInstructionPointer(g_main_module.entry_point);
+    // RDI = pointer to argc block (same format as stack), RSI = 0 (no cleanup)
+    g_cpu->Regs().rdi = setup_base;
+    g_cpu->Regs().rsi = 0;
+    g_cpu->SetTraceEnabled(false);
 
-    // CALL hle_stub_1  (E8 rel32)
-    wb(p, 0xE8);
-    int32_t rel1 = (int32_t)((int64_t)(hle_base + 16) - (int64_t)(p + 5));
-    memcpy(g_emu_memory + (p + 1 - EMU_BASE_ADDR), &rel1, 4);
-    p += 5;
-
-    // CALL hle_stub_2  (E8 rel32)
-    wb(p, 0xE8);
-    int32_t rel2 = (int32_t)((int64_t)(hle_base + 32) - (int64_t)(p + 5));
-    memcpy(g_emu_memory + (p + 1 - EMU_BASE_ADDR), &rel2, 4);
-    p += 5;
-
-    // MOV RDI, imm64 (48 BF imm64) — set up process info pointer
-    wb(p, 0x48); wb(p+1, 0xBF);
-    memcpy(g_emu_memory + (p + 2 - EMU_BASE_ADDR), &setup_base, 8);
-    p += 10;
-
-    // XOR ESI, ESI (31 F6) — RSI = 0
-    wb(p, 0x31); wb(p+1, 0xF6);
-    p += 2;
-
-    // JMP entry_point (E9 rel32)
-    wb(p, 0xE9);
-    int32_t rel_entry = (int32_t)((int64_t)g_main_module.entry_point - (int64_t)(p + 5));
-    memcpy(g_emu_memory + (p + 1 - EMU_BASE_ADDR), &rel_entry, 4);
-    p += 5;
-
-    g_cpu->SetStackPointer(EMU_STACK_TOP);
-    g_cpu->SetInstructionPointer(shim_addr);
-
-    printf("[kytyps5] boot shim at 0x%llx, entry at 0x%llx, hle_base at 0x%llx\n",
-           (unsigned long long)shim_addr,
+    printf("[kytyps5] entry at 0x%llx, stack at 0x%llx, args at 0x%llx\n",
            (unsigned long long)g_main_module.entry_point,
-           (unsigned long long)hle_base);
+           (unsigned long long)stack_top,
+           (unsigned long long)setup_base);
 
     state->game_loaded = true;
     state->running = true;
