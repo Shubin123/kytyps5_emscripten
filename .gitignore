@@ -1,0 +1,11 @@
+build-web/
+build-web-dev/
+.cache/
+upstream/
+*.o
+*.a
+*.wasm
+*.data
+.DS_Store
+compile_commands.json
+mvk_shim/
