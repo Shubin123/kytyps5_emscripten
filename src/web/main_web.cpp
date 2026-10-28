@@ -381,6 +381,10 @@ static bool LoadELF(const char* path) {
             return vaddr + reloc_offset - EMU_BASE_ADDR;
         };
 
+        // HLE stub allocation — shared by JUMP_SLOT and GLOB_DAT
+        uint64_t hle_base = EMU_BASE_ADDR + EMU_MEM_SIZE - 0x100000;
+        int hle_idx = 0;
+
         // Process JUMP_SLOT relocations — patch GOT to point to HLE stubs
         if (jmprel_vaddr && pltrelsz && symtab_vaddr && strtab_vaddr) {
             uint64_t jmprel_off = mem_off(jmprel_vaddr);
@@ -389,9 +393,6 @@ static bool LoadELF(const char* path) {
 
             int num_jmprel = pltrelsz / sizeof(Elf64_Rela);
             printf("[loader] processing %d JUMP_SLOT relocations\n", num_jmprel);
-
-            uint64_t hle_base = EMU_BASE_ADDR + EMU_MEM_SIZE - 0x100000;
-            int hle_idx = 0;
 
             for (int j = 0; j < num_jmprel; j++) {
                 if (jmprel_off + (j + 1) * sizeof(Elf64_Rela) > EMU_MEM_SIZE) break;
@@ -466,12 +467,39 @@ static bool LoadELF(const char* path) {
                         patched++;
                     }
                 } else if (type == R_X86_64_GLOB_DAT) {
-                    // Similar to JUMP_SLOT — patch to an HLE stub
-                    uint64_t addr_off = rela->r_offset + reloc_offset - EMU_BASE_ADDR;
-                    if (addr_off + 8 <= EMU_MEM_SIZE) {
-                        *reinterpret_cast<uint64_t*>(g_emu_memory + addr_off) = 0;
-                        patched++;
+                    // Patch to HLE stub (same as JUMP_SLOT)
+                    uint32_t sym_idx = ELF64_R_SYM(rela->r_info);
+                    const char* nid = "";
+                    if (symtab_vaddr && strtab_vaddr) {
+                        uint64_t symtab_off2 = mem_off(symtab_vaddr);
+                        uint64_t strtab_off2 = mem_off(strtab_vaddr);
+                        uint64_t sym_off = symtab_off2 + sym_idx * syment;
+                        if (sym_off + sizeof(Elf64_Sym) <= EMU_MEM_SIZE) {
+                            auto* sym = reinterpret_cast<Elf64_Sym*>(g_emu_memory + sym_off);
+                            uint64_t name_off = strtab_off2 + sym->st_name;
+                            if (name_off < strtab_off2 + strsz && name_off < EMU_MEM_SIZE)
+                                nid = reinterpret_cast<const char*>(g_emu_memory + name_off);
+                        }
                     }
+                    uint64_t stub_addr = hle_base + hle_idx * 16;
+                    hle_idx++;
+                    uint64_t addr_off = rela->r_offset + reloc_offset - EMU_BASE_ADDR;
+                    if (addr_off + 8 <= EMU_MEM_SIZE)
+                        *reinterpret_cast<uint64_t*>(g_emu_memory + addr_off) = stub_addr;
+                    uint64_t stub_off = stub_addr - EMU_BASE_ADDR;
+                    if (stub_off < EMU_MEM_SIZE)
+                        g_emu_memory[stub_off] = 0xC3; // RET
+                    std::string nid_str(nid);
+                    g_cpu->RegisterHLEFunction(stub_addr,
+                        [nid_str, stub_addr](KytyWeb::X86Regs& r, uint64_t) {
+                            g_hle_call_count++;
+                            if (g_hle_call_count <= 100)
+                                printf("[hle] GLOB call #%d: NID=%s addr=0x%llx\n",
+                                       g_hle_call_count, nid_str.c_str(),
+                                       (unsigned long long)stub_addr);
+                            r.rax = 0;
+                        });
+                    patched++;
                 }
             }
             printf("[loader] processed %d RELA relocations (of %d)\n", patched, num_rela);
