@@ -37,6 +37,24 @@ std::string Str(uint64_t a) {
     return s;
 }
 
+// IL2CPP throws managed exceptions wrapped in an Il2CppExceptionWrapper whose first field is the Il2CppException;
+// its class (name at +0x10, namespace at +0x18) and message (System.String: length at +0x10, UTF-16 at +0x14).
+std::string ManagedString(uint64_t s) {
+    std::string out;
+    const int32_t n = s ? Rd<int32_t>(s + 0x10) : 0;
+    for (int32_t i = 0; i < n && i < 400; i++) {
+        const uint16_t c = Rd<uint16_t>(s + 0x14 + 2ull * i);
+        out += c < 0x80 ? (char)c : '?';
+    }
+    return out;
+}
+std::string ManagedException(uint64_t wrapper) {
+    const uint64_t ex = Rd<uint64_t>(wrapper), klass = ex ? Rd<uint64_t>(ex) : 0;
+    if (!klass) return "(null)";
+    return Str(Rd<uint64_t>(klass + 0x18)) + "." + Str(Rd<uint64_t>(klass + 0x10)) + ": " +
+           ManagedString(Rd<uint64_t>(ex + 0x18));
+}
+
 int g_logs = 0;
 #define EH_LOG(...)                        \
     do {                                   \
@@ -508,6 +526,12 @@ void RaiseException(X86Regs& r, uint64_t header, const Frame& start) {
                 Wr<uint64_t>(header + kAdjusted, adjusted);
                 EH_LOG("%s: handler in the function at 0x%llx, %d frames up\n", TypeName(thrown).c_str(),
                        (unsigned long long)fde.pc_begin, depth);
+                static int managed_logs = 0;
+                if (managed_logs < 200 && TypeName(thrown).find("Il2CppExceptionWrapper") != std::string::npos) {
+                    managed_logs++;
+                    printf("[eh] managed exception %s (thrown from 0x%llx)\n", ManagedException(obj).c_str(),
+                           (unsigned long long)start.r[kRa]);
+                }
                 return ContinueUnwind(r, header, start);
             }
         }

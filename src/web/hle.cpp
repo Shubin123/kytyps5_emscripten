@@ -5,6 +5,8 @@
 #include "web_platform.h"
 
 #include <fcntl.h>
+#include <dirent.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -266,6 +268,15 @@ uint64_t VmAlloc(uint64_t size, uint64_t align, int prot, HleRegion kind, uint64
                 printf("[hle]   0x%llx-0x%llx %6llu KB %s\n", (unsigned long long)big[i]->start,
                        (unsigned long long)big[i]->end, (unsigned long long)((big[i]->end - big[i]->start) >> 10),
                        big[i]->name);
+            std::map<std::string, std::pair<uint64_t, int>> by_name;  // name -> (bytes, regions)
+            for (const Region* g : big) {
+                auto& e = by_name[g->name[0] ? g->name : "(unnamed)"];
+                e.first += g->end - g->start;
+                e.second++;
+            }
+            for (auto& [name, e] : by_name)
+                printf("[hle]   total %6llu MB in %d regions: %s\n", (unsigned long long)(e.first >> 20), e.second,
+                       name.c_str());
         }
         return 0;
     }
@@ -471,9 +482,46 @@ std::string Format(uint64_t fmt_addr, ArgSrc& a) {
 
 // --- files ---
 
+std::string g_app_root = "/game";  // where /app0 lives on the host: the browser's MEMFS mount or a directory
+bool LazyStatPath(const std::string& path, struct stat* st);
+std::string LazyMatchName(const std::string& dir, const std::string& name);
+
+// The PS5's file system ignores case and the host's may not: a path that doesn't exist as written is resolved
+// one component at a time against the directory listing (and the streamed files).
+std::string ResolveCase(const std::string& root, const std::string& rel) {
+    static std::unordered_map<std::string, std::string> cache;
+    const std::string direct = root + rel;
+    struct stat st;
+    if (LazyStatPath(direct, &st) || stat(direct.c_str(), &st) == 0) return direct;
+    if (auto it = cache.find(direct); it != cache.end()) return it->second;
+    std::string cur = root;
+    size_t pos = 0;
+    while (pos < rel.size()) {
+        if (rel[pos] == '/') { pos++; continue; }
+        const size_t end = std::min(rel.find('/', pos), rel.size());
+        const std::string name = rel.substr(pos, end - pos);
+        std::string next = cur + "/" + name;
+        if (!LazyStatPath(next, &st) && stat(next.c_str(), &st) != 0) {
+            std::string match = LazyMatchName(cur, name);
+            if (match.empty()) {
+                if (DIR* d = opendir(cur.c_str())) {
+                    while (dirent* e = readdir(d))
+                        if (!strcasecmp(e->d_name, name.c_str())) { match = e->d_name; break; }
+                    closedir(d);
+                }
+            }
+            if (!match.empty()) next = cur + "/" + match;
+        }
+        cur = next;
+        pos = end;
+    }
+    cache[direct] = cur;
+    return cur;
+}
+
 std::string HostPath(const std::string& guest) {
     static const char* kScratchMounts[] = {"/temp0", "/temp", "/download0", "/savedata0", "/data"};
-    if (guest.rfind("/app0", 0) == 0) return "/game" + guest.substr(5);
+    if (guest.rfind("/app0", 0) == 0) return ResolveCase(g_app_root, guest.substr(5));
     for (const char* m : kScratchMounts) {
         size_t n = strlen(m);
         if (guest.compare(0, n, m) == 0 && (guest.size() == n || guest[n] == '/')) {
@@ -970,6 +1018,15 @@ void KernelIsStack(X86Regs& r) {
 }
 
 void RetZero(X86Regs& r) { r.rax = 0; }
+void RetEinval(X86Regs& r) { Ret(r, kSceErrEinval); }
+// Getters that report through their second argument: settings off, an adult signed-out user, default priority.
+void OutInt0(X86Regs& r) { Wr<int32_t>(r.rsi, 0); r.rax = 0; }
+void UserServiceGetAgeLevel(X86Regs& r) { Wr<int32_t>(r.rsi, 18); r.rax = 0; }
+void UserServiceGetGamePresets(X86Regs& r) { if (auto* p = Ptr(r.rsi, 32)) memset(p, 0, 32); r.rax = 0; }
+void NpGetState(X86Regs& r) { Wr<int32_t>(r.rsi, 1); r.rax = 0; }  // SCE_NP_STATE_SIGNED_OUT
+void NpGetAccountCountry(X86Regs& r) { PutStr(r.rsi, 4, "us"); r.rax = 0; }
+void PthreadGetschedparam(X86Regs& r) { Wr<int32_t>(r.rsi, 0); Wr<int32_t>(r.rdx, 700); r.rax = 0; }  // (thread, policy*, param*)
+void PthreadAttrGetschedparam(X86Regs& r) { Wr<int32_t>(r.rsi, 700); r.rax = 0; }
 void ThreadEqual(X86Regs& r) { r.rax = r.rdi == r.rsi; }
 void WriteNewHandle(X86Regs& r) { Wr<uint64_t>(r.rdi, NewHandle()); r.rax = 0; }
 void KeyCreate(X86Regs& r) { Wr<uint32_t>(r.rdi, g_next_key++); r.rax = 0; }
@@ -1896,6 +1953,18 @@ std::set<std::pair<int, uint64_t>> g_lazy_requested;   // queued or being fetche
 std::list<std::pair<int, uint64_t>> g_lazy_lru;        // most recently used first
 uint64_t g_lazy_bytes = 0;
 
+// The name of a streamed file or directory inside dir that matches name ignoring case, or "".
+std::string LazyMatchName(const std::string& dir, const std::string& name) {
+    const std::string prefix = dir + "/";
+    for (const auto& [path, file] : g_lazy_by_path) {
+        if (path.size() <= prefix.size() || path.compare(0, prefix.size(), prefix) != 0) continue;
+        const size_t end = std::min(path.find('/', prefix.size()), path.size());
+        const std::string component = path.substr(prefix.size(), end - prefix.size());
+        if (!strcasecmp(component.c_str(), name.c_str())) return component;
+    }
+    return "";
+}
+
 int LazyOpen(const std::string& path) {
     auto it = g_lazy_by_path.find(path);
     if (it == g_lazy_by_path.end()) return -1;
@@ -2205,6 +2274,16 @@ const Impl kImpls[] = {
     {"__udivti3", Udivti3}, {"_Atomic_fetch_add_4", AtomicFetchAdd4}, {"_Atomic_fetch_sub_4", AtomicFetchSub4},
     {"_Mtx_init", MtxInit}, {"_Cnd_init", CndInit}, {"_Mtx_destroy", RetZero}, {"_Cnd_destroy", RetZero},
     {"setjmp", Setjmp}, {"longjmp", Longjmp},
+    {"sceUserServiceGetAccessibilityTriggerEffect", OutInt0}, {"sceUserServiceGetAccessibilityVibration", OutInt0},
+    {"sceUserServiceGetAccessibilityChatTranscription", OutInt0},
+    {"sceUserServiceGetAccessibilityPressAndHoldDelay", OutInt0},
+    {"sceUserServiceGetAgeLevel", UserServiceGetAgeLevel}, {"sceUserServiceGetGamePresets", UserServiceGetGamePresets},
+    {"sceNpGetState", NpGetState}, {"sceNpGetNpReachabilityState", OutInt0},
+    {"sceNpGetAccountCountryA", NpGetAccountCountry},
+    {"scePthreadGetschedparam", PthreadGetschedparam}, {"scePthreadAttrGetschedparam", PthreadAttrGetschedparam},
+    {"scePthreadSetschedparam", RetZero},
+    // No native backtraces: callers (Il2Cpp's exception stack traces) see the error and skip them.
+    {"sceLibcBacktraceGetBufferSize", RetEinval}, {"sceLibcBacktraceSelf", RetEinval},
     {"sceKernelInstallExceptionHandler", InstallExceptionHandler},
     {"sceKernelRemoveExceptionHandler", RemoveExceptionHandler}, {"sceKernelRaiseException", RaiseException},
     {"sceAudioOutInit", RetZero}, {"sceAudioOutOpen", AudioOutOpen}, {"sceAudioOutClose", AudioOutClose},
@@ -2263,6 +2342,7 @@ void HleInit(const HleLayout& layout) {
     AgcSetup(layout);
     GpuSetup(layout);
     AmprSetup(layout);
+    AvPlayerSetup(layout);
     g_tm = g_heap.Alloc(64, 16);
     g_ctype = g_heap.Alloc(257 * 2, 16);
     g_tolower = g_heap.Alloc(257 * 2, 16);
@@ -2310,6 +2390,7 @@ HleFn HleFind(const std::string& nid) {
     if (HleFn f = AgcFind(nid)) return f;
     if (HleFn f = GpuFind(nid)) return f;
     if (HleFn f = AmprFind(nid)) return f;
+    if (HleFn f = AvPlayerFind(nid)) return f;
     auto it = g_by_nid.find(nid);
     return it == g_by_nid.end() ? nullptr : it->second;
 }
@@ -2319,11 +2400,14 @@ const char* HleName(const std::string& nid) {
     if (const char* n = AgcName(nid)) return n;
     if (const char* n = GpuName(nid)) return n;
     if (const char* n = AmprName(nid)) return n;
+    if (const char* n = AvPlayerName(nid)) return n;
     auto it = g_names.find(nid);
     return it == g_names.end() ? nullptr : it->second;
 }
 
 bool HleHaltRequested() { return g_halt; }
+void HleSetAppRoot(const std::string& host_dir) { g_app_root = host_dir; }
+std::string HleHostPath(const std::string& guest_path) { return HostPath(guest_path); }
 uint64_t HleCurrentThread() { return Cur()->handle; }
 void HleFree(uint64_t addr) { g_heap.Free(addr); }
 void HleTerminate(const char* why) { Halt(why); }
@@ -2342,6 +2426,8 @@ void HleRegisterModuleTls(uint64_t module_id, uint64_t image, uint64_t filesz, u
 void HlePark(const char* what, std::function<bool()> ready) { Park(what, std::move(ready)); }
 bool HleFirstEntry(const X86Regs& r) { return FirstEntry(r); }
 void HleEndCall() { EndCall(); }
+
+int64_t HleUsecSinceStart() { return UsecSinceStart(); }
 
 bool HleFileSize(const std::string& guest_path, uint64_t* size) {
     struct stat st{};

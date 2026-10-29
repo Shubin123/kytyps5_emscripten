@@ -17,10 +17,13 @@
 #include <chrono>
 
 #include <sys/stat.h>
+#include <unistd.h>
 #include <unordered_map>
 
+#ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #include <emscripten/html5.h>
+#endif
 
 // ---- ELF structures for PS5 eboot.bin loading ----
 
@@ -106,7 +109,11 @@ constexpr uint32_t R_X86_64_RELATIVE  = 8;
 #define ELF64_R_TYPE(i)  ((uint32_t)((i) & 0xffffffff))
 
 constexpr uint64_t EMU_BASE_ADDR = 0x100000;
-constexpr uint64_t EMU_MEM_SIZE  = 1536ULL * 1024 * 1024; // 1.5 GB emulated address space (Unity reserves a lot)
+// Emulated address space; Unity's allocators map over a gigabyte for a 2D game. wasm32 tops out at 4 GB.
+#ifndef KYTY_EMU_MEM_MB
+#define KYTY_EMU_MEM_MB 3072
+#endif
+constexpr uint64_t EMU_MEM_SIZE  = (uint64_t)KYTY_EMU_MEM_MB * 1024 * 1024;
 // Layout: image | malloc heap | kernel mappings | main stack | HLE stubs + process args
 constexpr uint64_t HLE_STUB_BASE  = EMU_BASE_ADDR + EMU_MEM_SIZE - 0x100000;
 constexpr uint64_t PROC_ARGS_ADDR = HLE_STUB_BASE + 0x80000;
@@ -155,6 +162,7 @@ struct ModuleImage {
 };
 static std::vector<ModuleImage> g_modules;                 // module handle = index + 1; the eboot is 1
 static std::unordered_map<std::string, uint64_t> g_exports;  // NID -> address
+static std::unordered_map<uint64_t, std::unordered_map<std::string, uint64_t>> g_module_exports;  // by handle
 
 struct Import {
     std::string nid;
@@ -169,6 +177,7 @@ static std::vector<Import> g_imports;
 static std::unordered_map<std::string, size_t> g_import_index;
 
 static void HleLoadStartModule(KytyWeb::X86Regs& r);
+static void HleDlsym(KytyWeb::X86Regs& r);
 
 static bool InEmu(uint64_t a, uint64_t n) { return a >= EMU_BASE_ADDR && n <= EMU_MEM_SIZE && a - EMU_BASE_ADDR <= EMU_MEM_SIZE - n; }
 static void W64(uint64_t a, uint64_t v) { if (InEmu(a, 8)) memcpy(g_emu_memory + (a - EMU_BASE_ADDR), &v, 8); }
@@ -188,6 +197,7 @@ static size_t StubImport(const std::string& nid) {
     const char* name = KytyWeb::HleName(nid);
     KytyWeb::HleFn fn = KytyWeb::HleFind(nid);
     if (name && !strcmp(name, "sceKernelLoadStartModule")) fn = HleLoadStartModule;
+    if (name && !strcmp(name, "sceKernelDlsym")) fn = HleDlsym;
     g_imports.push_back({nid, name, fn, 0, stub, {}, false});
     g_import_index[nid] = idx;
     g_emu_memory[stub - EMU_BASE_ADDR] = 0xC3;
@@ -287,6 +297,7 @@ static size_t LinkImage(const DynInfo& di, uint64_t bias, uint64_t module_id, Mo
         if (!s || !s->st_shndx || !name[0]) continue;
         std::string nid(name, strcspn(name, "#"));
         if (nid == kModuleStartNid) { m.start = bias + s->st_value; continue; }
+        g_module_exports[module_id][nid] = bias + s->st_value;
         if (g_exports.emplace(nid, bias + s->st_value).second) exported++;
     }
     size_t bound = 0, unsupported = 0;
@@ -325,7 +336,7 @@ static size_t LinkImage(const DynInfo& di, uint64_t bias, uint64_t module_id, Mo
 constexpr uint64_t GUEST_RETURN_TRAP = PROC_ARGS_ADDR - 0x10;
 static bool g_guest_returned = false;
 
-static uint64_t CallGuest(uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2 = 0) {
+static uint64_t CallGuest(uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2 = 0, uint64_t a3 = 0) {
     static bool trap_ready = false;
     if (!trap_ready) {
         g_emu_memory[GUEST_RETURN_TRAP - EMU_BASE_ADDR] = 0xC3;
@@ -337,6 +348,7 @@ static uint64_t CallGuest(uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2 = 0
     r.rdi = a0;
     r.rsi = a1;
     r.rdx = a2;
+    r.rcx = a3;
     r.rsp = ((saved.rsp - 512) & ~0xFULL) - 8;  // below the caller's red zone; aligned as after a call
     W64(r.rsp, GUEST_RETURN_TRAP);
     r.rip = fn;
@@ -427,8 +439,16 @@ static int LoadPrx(const std::string& host_path, const std::string& name) {
 static void HleLoadStartModule(KytyWeb::X86Regs& r) {
     const std::string guest = GuestStr(r.rdi);
     const uint64_t args = r.rsi, argp = r.rdx, res = r.r9;
-    const std::string host = guest.rfind("/app0", 0) == 0 ? "/game" + guest.substr(5) : guest;
+    const std::string host = KytyWeb::HleHostPath(guest);
     const std::string name = guest.substr(guest.find_last_of('/') + 1);
+    // Modules are never unloaded (sceKernelStopUnloadModule does nothing), so loading one again returns the
+    // handle it already has; Unity loads its native plugins over and over to look up symbols.
+    static std::unordered_map<std::string, int> loaded;
+    if (auto it = loaded.find(host); it != loaded.end()) {
+        if (res) W32(res, 0);
+        r.rax = (uint64_t)it->second;
+        return;
+    }
     int id = -1;
     for (const std::string& p : {host + ".esbak", host}) {
         struct stat st;
@@ -448,9 +468,80 @@ static void HleLoadStartModule(KytyWeb::X86Regs& r) {
     printf("[loader] started %s (%s returned %lld)\n", name.c_str(), m.start ? "module_start" : "DT_INIT",
            (long long)start_ret);
     if (res) W32(res, (uint32_t)start_ret);
+    loaded[host] = id;
     r.rax = (uint64_t)id;
 }
 
+
+// Symbol NIDs: the first 8 bytes of SHA-1(name + suffix), byte-reversed, base64 with '-' for '/'.
+static std::string SymbolNid(const std::string& name) {
+    static const uint8_t kSuffix[16] = {0x51, 0x8D, 0x64, 0xA6, 0x35, 0xDE, 0xD8, 0xC1,
+                                        0xE6, 0xB0, 0x39, 0xB1, 0xC3, 0xE5, 0x52, 0x30};
+    std::vector<uint8_t> msg(name.begin(), name.end());
+    msg.insert(msg.end(), kSuffix, kSuffix + 16);
+    const uint64_t bits = (uint64_t)msg.size() * 8;
+    msg.push_back(0x80);
+    while (msg.size() % 64 != 56) msg.push_back(0);
+    for (int i = 7; i >= 0; i--) msg.push_back((uint8_t)(bits >> (8 * i)));
+    uint32_t h[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
+    auto rol = [](uint32_t v, int n) { return (v << n) | (v >> (32 - n)); };
+    for (size_t off = 0; off < msg.size(); off += 64) {
+        uint32_t w[80];
+        for (int i = 0; i < 16; i++)
+            w[i] = (uint32_t)msg[off + 4 * i] << 24 | (uint32_t)msg[off + 4 * i + 1] << 16 |
+                   (uint32_t)msg[off + 4 * i + 2] << 8 | msg[off + 4 * i + 3];
+        for (int i = 16; i < 80; i++) w[i] = rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+        for (int i = 0; i < 80; i++) {
+            uint32_t f, k;
+            if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
+            else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+            else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+            const uint32_t t = rol(a, 5) + f + e + k + w[i];
+            e = d; d = c; c = rol(b, 30); b = a; a = t;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+    }
+    uint8_t digest[8];
+    for (int i = 0; i < 8; i++) digest[i] = (uint8_t)(h[i / 4] >> (24 - 8 * (i % 4)));
+    uint8_t raw[8];
+    for (int i = 0; i < 8; i++) raw[i] = digest[7 - i];
+    static const char* kB64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-";
+    std::string out;
+    uint32_t acc = 0;
+    int nbits = 0;
+    for (uint8_t byte : raw) {
+        acc = (acc << 8) | byte;
+        nbits += 8;
+        while (nbits >= 6) { out += kB64[(acc >> (nbits - 6)) & 63]; nbits -= 6; }
+    }
+    if (nbits) out += kB64[(acc << (6 - nbits)) & 63];
+    return out;
+}
+
+// sceKernelDlsym(handle, name, address*): the module's export, then any module's, then an SDK function.
+static void HleDlsym(KytyWeb::X86Regs& r) {
+    const std::string name = GuestStr(r.rsi);
+    const std::string nid = SymbolNid(name);
+    uint64_t addr = 0;
+    if (auto m = g_module_exports.find(r.rdi & 0xffffffff); m != g_module_exports.end()) {
+        if (auto e = m->second.find(nid); e != m->second.end()) addr = e->second;
+    }
+    if (!addr) {
+        if (auto e = g_exports.find(nid); e != g_exports.end()) addr = e->second;
+    }
+    if (!addr && KytyWeb::HleFind(nid)) addr = g_imports[StubImport(nid)].stub;
+    if (!addr) {
+        static int logged = 0;
+        if (logged++ < 40) printf("[hle] dlsym %s (%s) in module %llu: not found\n", name.c_str(), nid.c_str(),
+                                  (unsigned long long)r.rdi);
+        r.rax = (uint64_t)(int64_t)(int32_t)0x80020002;
+        return;
+    }
+    W64(r.rdx, addr);
+    r.rax = 0;
+}
 
 // Printed once when execution makes no SDK calls for several frames, to diagnose spin loops.
 static void DumpStall() {
@@ -463,7 +554,7 @@ static void DumpStall() {
     for (int i = 0; i < 16; i++) {
         printf("[stall] %-3s = 0x%llx", names[i], (unsigned long long)vals[i]);
         uint64_t v = vals[i];
-        if (v >= EMU_BASE_ADDR && v + 32 <= EMU_BASE_ADDR + EMU_MEM_SIZE) {
+        if (InEmu(v, 32)) {
             printf("  ->");
             for (int b = 0; b < 32; b++) printf(" %02x", g_emu_memory[v - EMU_BASE_ADDR + b]);
         }
@@ -471,7 +562,7 @@ static void DumpStall() {
     }
     std::string trace;
     uint64_t fp = r.rbp;
-    for (int depth = 0; depth < 16 && fp >= EMU_BASE_ADDR && fp + 16 <= EMU_BASE_ADDR + EMU_MEM_SIZE; depth++) {
+    for (int depth = 0; depth < 16 && InEmu(fp, 16); depth++) {
         uint64_t next, ret;
         memcpy(&next, g_emu_memory + (fp - EMU_BASE_ADDR), 8);
         memcpy(&ret, g_emu_memory + (fp + 8 - EMU_BASE_ADDR), 8);
@@ -644,6 +735,9 @@ static bool LoadELF(const char* path) {
     KytyWeb::HleLayout layout{};
     layout.cpu = g_cpu;
     layout.call_guest = [](uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2) { return CallGuest(fn, a0, a1, a2); };
+    layout.call_guest4 = [](uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
+        return CallGuest(fn, a0, a1, a2, a3);
+    };
     layout.mem = g_emu_memory;
     layout.base = EMU_BASE_ADDR;
     layout.size = EMU_MEM_SIZE;
@@ -714,11 +808,13 @@ static void MainLoop() {
         state->fps = g_fps;
         state->frame_count++;
 
+#ifdef __EMSCRIPTEN__
         EM_ASM({
             if (typeof window !== 'undefined' && window.kytyOnFPS) {
                 window.kytyOnFPS($0);
             }
         }, g_fps);
+#endif
     }
 
     // Run interpreter for a time slice
@@ -757,8 +853,7 @@ static void MainLoop() {
         } else if (exc == KytyWeb::X86Exception::PageFault) {
             uint64_t rip = g_cpu->FaultRip();
             uint8_t bytes[8] = {};
-            if (rip >= EMU_BASE_ADDR && rip + 8 <= EMU_BASE_ADDR + EMU_MEM_SIZE)
-                memcpy(bytes, g_emu_memory + (rip - EMU_BASE_ADDR), 8);
+            if (InEmu(rip, 8)) memcpy(bytes, g_emu_memory + (rip - EMU_BASE_ADDR), 8);
             printf("[cpu] page fault: access to unmapped address 0x%llx by the instruction at RIP=0x%llx "
                    "(%02x %02x %02x %02x %02x %02x), halting\n",
                    (unsigned long long)g_cpu->FaultAddress(), (unsigned long long)rip,
@@ -839,6 +934,7 @@ int kyty_init(const char* config_json) {
 
 int kyty_load_game(const char* game_path) {
     printf("[kytyps5] loading game: %s\n", game_path);
+    KytyWeb::HleSetAppRoot(game_path);
 
     auto* state = KytyWeb::GetState();
 
@@ -943,7 +1039,9 @@ int kyty_load_game(const char* game_path) {
     // Start the main loop
     g_fps_timer = SteadyClock::now();
     g_frame_count = 0;
+#ifdef __EMSCRIPTEN__
     emscripten_set_main_loop(MainLoop, 0, 0);
+#endif
 
     printf("[kytyps5] game loaded and running\n");
     return 0;
@@ -990,6 +1088,7 @@ void kyty_input_values(int buttons, float lx, float ly, float rx, float ry, floa
 int kyty_get_screen_width() { return g_screen_w; }
 int kyty_get_screen_height() { return g_screen_h; }
 
+#ifdef __EMSCRIPTEN__
 int main(int argc, char** argv) {
     printf("[kytyps5] KytyPS5 WebAssembly Emulator\n");
     printf("[kytyps5] waiting for initialization from frontend...\n");
@@ -1003,5 +1102,51 @@ int main(int argc, char** argv) {
 
     return 0;
 }
+#else
+// Native headless runner (tools/native): kytyps5 <game dir> [frames], one frame = one MainLoop time slice.
+// KYTY_PRESS="flip:buttons:flips,..." holds the frontend's button bits (web/input.js) from a presented frame on.
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <game dir with eboot.bin> [frames]\n", argv[0]);
+        return 2;
+    }
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    const long frames = argc > 2 ? atol(argv[2]) : 100000;
+    struct Press { uint64_t flip, buttons, flips; };
+    std::vector<Press> presses;
+    if (const char* s = getenv("KYTY_PRESS")) {
+        for (const char* p = s; *p;) {
+            char* end = nullptr;
+            Press press{};
+            press.flip = strtoull(p, &end, 0);
+            if (end == p) break;
+            if (*end == ':') press.buttons = strtoull(end + 1, &end, 0);
+            if (*end == ':') press.flips = strtoull(end + 1, &end, 0);
+            presses.push_back(press);
+            p = *end == ',' ? end + 1 : end;
+        }
+    }
+    kyty_init("{}");
+    if (kyty_load_game(argv[1]) != 0) return 1;
+    uint64_t held = 0;
+    for (long i = 0; i < frames && g_running; i++) {
+        if (!presses.empty()) {
+            const uint64_t flip = KytyWeb::GpuFlipCount();
+            uint64_t want = 0;
+            for (const Press& p : presses)
+                if (flip >= p.flip && flip < p.flip + p.flips) want |= p.buttons;
+            if (want != held) {
+                printf("[input] flip %llu: buttons 0x%llx\n", (unsigned long long)flip, (unsigned long long)want);
+                kyty_input_values((int)want, 0, 0, 0, 0, 0, 0);
+                held = want;
+            }
+        }
+        const uint64_t before = g_total_insn;
+        MainLoop();
+        if (g_total_insn == before) usleep(2000);  // every thread is waiting: let wall-clock time pass
+    }
+    return 0;
+}
+#endif
 
 } // extern "C"

@@ -14,6 +14,8 @@ struct HleLayout {
     X86Interpreter* cpu;
     // Runs guest code fn(a0, a1, a2) to completion (e.g. qsort comparators) and returns rax.
     uint64_t (*call_guest)(uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2);
+    // The same with a fourth argument (rcx).
+    uint64_t (*call_guest4)(uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
     uint8_t* mem;
     uint64_t base, size;
     uint64_t heap_start, heap_end;
@@ -35,11 +37,19 @@ HleFn HleFind(const std::string& nid);
 const char* HleName(const std::string& nid);
 // Set when the game calls exit/abort or fails a stack check.
 bool HleHaltRequested();
+// The host directory holding the game (/app0), and the host path of a guest path.
+void HleSetAppRoot(const std::string& host_dir);
+std::string HleHostPath(const std::string& guest_path);
 
 // libSceAgc command-buffer builders and shader/state helpers (agc.cpp, ported from KytyPS5).
 void AgcSetup(const HleLayout& layout);
 HleFn AgcFind(const std::string& nid);
 const char* AgcName(const std::string& nid);
+
+// sceAvPlayer without decoders: movies play for their length as black frames (avplayer.cpp).
+void AvPlayerSetup(const HleLayout& layout);
+HleFn AvPlayerFind(const std::string& nid);
+const char* AvPlayerName(const std::string& nid);
 
 // GPU stand-in: AGC driver submission, video out (gpu.cpp).
 void GpuSetup(const HleLayout& layout);
@@ -47,6 +57,8 @@ HleFn GpuFind(const std::string& nid);
 // Resumes command buffers stopped at a wait whose condition now holds.
 void GpuPoll();
 const char* GpuName(const std::string& nid);
+// Frames presented so far.
+uint64_t GpuFlipCount();
 
 // libSceAmpr / APR asynchronous file I/O (ampr.cpp, ported from KytyPS5).
 void AmprSetup(const HleLayout& layout);
@@ -76,6 +88,8 @@ void HleEndCall();
 bool HleFileSize(const std::string& guest_path, uint64_t* size);
 int64_t HleReadFileRange(const std::string& guest_path, uint64_t offset, uint64_t size, uint64_t guest_dst,
                          bool* pending);
+// The guest's process clock (sceKernelGetProcessTime).
+int64_t HleUsecSinceStart();
 
 // Kernel event queues, for producers outside hle.cpp. filter: e.g. -13 graphics, -12 video out.
 void HleEqueueAddEvent(uint64_t eq, uint64_t ident, int16_t filter, uint64_t udata);
