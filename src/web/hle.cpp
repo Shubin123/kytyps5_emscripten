@@ -127,14 +127,28 @@ void Halt(const char* why) {
 
 // --- malloc arena ---
 
+uint64_t VmAlloc(uint64_t size, uint64_t align, int prot, HleRegion kind, uint64_t phys, int mtype, const char* name);
+void Carve(uint64_t start, uint64_t end);
+
+// Small blocks come from the malloc arena; large ones are mapped in the vm range, which is bigger and gives the
+// space back when they're freed.
 struct Heap {
+    static constexpr uint64_t kLarge = 4ull << 20;
     uint64_t top = 0, end = 0, in_use = 0, peak = 0;
-    std::unordered_map<uint64_t, uint64_t> live;
+    std::unordered_map<uint64_t, uint64_t> live, large;
     std::multimap<uint64_t, uint64_t> free_blocks;  // size -> addr
 
     uint64_t Alloc(uint64_t size, uint64_t align) {
         size = (std::max<uint64_t>(size, 1) + 15) & ~15ULL;
         if (align < 16) align = 16;
+        if (size >= kLarge) {
+            const uint64_t a = VmAlloc(size, align, 3, HleRegion::Heap, 0, 0, "malloc (large)");
+            if (!a) { Exhausted(size); return 0; }
+            large[a] = size;
+            in_use += size;
+            peak = std::max(peak, in_use);
+            return a;
+        }
         uint64_t a = 0, s = 0;
         auto it = free_blocks.lower_bound(size);
         for (int i = 0; i < 16 && it != free_blocks.end() && it->first <= size * 2; ++i, ++it) {
@@ -143,7 +157,7 @@ struct Heap {
         if (!a) {
             a = (top + align - 1) / align * align;
             if (a + size > end || a + size < a) {
-                printf("[hle] malloc arena exhausted (request 0x%llx)\n", (unsigned long long)size);
+                Exhausted(size);
                 return 0;
             }
             top = a + size;
@@ -155,6 +169,13 @@ struct Heap {
         return a;
     }
     void Free(uint64_t a) {
+        auto big = large.find(a);
+        if (big != large.end()) {
+            in_use -= big->second;
+            Carve(a, a + big->second);
+            large.erase(big);
+            return;
+        }
         auto it = live.find(a);
         if (it == live.end()) return;
         in_use -= it->second;
@@ -163,10 +184,19 @@ struct Heap {
     }
     uint64_t SizeOf(uint64_t a) const {
         auto it = live.find(a);
-        return it == live.end() ? 0 : it->second;
+        if (it != live.end()) return it->second;
+        auto big = large.find(a);
+        return big == large.end() ? 0 : big->second;
     }
+    // Names the guest code asking (the return address of the SDK call in progress).
+    void Exhausted(uint64_t size) const;
 };
 Heap g_heap;
+void Heap::Exhausted(uint64_t size) const {
+    const uint64_t rsp = L.cpu->Regs().rsp;
+    printf("[hle] out of memory: 0x%llx bytes requested by the code at 0x%llx\n", (unsigned long long)size,
+           (unsigned long long)Rd<uint64_t>(rsp));
+}
 
 // --- virtual memory map ---
 
@@ -980,6 +1010,211 @@ void PosixMemalign(X86Regs& r) {
 void AlignedNew(X86Regs& r) { r.rax = g_heap.Alloc(r.rdi, r.rsi); }  // operator new(size, align)
 void Terminate(X86Regs&) { Halt("std::terminate called"); }
 void LengthError(X86Regs& r) { Halt(("std::length_error: " + Str(r.rdi, 200)).c_str()); }
+
+// libc: bounded and case-insensitive strings, the C11 _s variants, sscanf
+int CaseCmp(uint64_t a, uint64_t b, uint64_t n) {
+    for (uint64_t i = 0; i < n; i++) {
+        const int ca = tolower(Rd<uint8_t>(a + i)), cb = tolower(Rd<uint8_t>(b + i));
+        if (ca != cb) return ca - cb;
+        if (!ca) return 0;
+    }
+    return 0;
+}
+void Strcasecmp(X86Regs& r) { Ret(r, CaseCmp(r.rdi, r.rsi, UINT64_MAX)); }
+void Strncasecmp(X86Regs& r) { Ret(r, CaseCmp(r.rdi, r.rsi, r.rdx)); }
+void Strlcpy(X86Regs& r) {  // (dst, src, size) -> strlen(src)
+    const size_t n = StrLen(r.rsi);
+    if (r.rdx) PutStr(r.rdi, r.rdx, Str(r.rsi, n + 1));
+    r.rax = n;
+}
+void Strspn(X86Regs& r) {
+    const std::string set = Str(r.rsi);
+    uint64_t n = 0;
+    for (uint8_t c; (c = Rd<uint8_t>(r.rdi + n)) != 0 && set.find((char)c) != std::string::npos;) n++;
+    r.rax = n;
+}
+uint64_t g_strerror_buf = 0;
+void Strerror(X86Regs& r) {
+    if (!g_strerror_buf) g_strerror_buf = g_heap.Alloc(128, 16);
+    PutStr(g_strerror_buf, 128, "error " + std::to_string((int)r.rdi));
+    r.rax = g_strerror_buf;
+}
+// C11 Annex K: (dst, dst_size, ...) return 0, or an error after clearing the destination.
+void MemcpyS(X86Regs& r) {  // (dst, dst_size, src, count)
+    if (!r.rdi) { Ret(r, 22); return; }
+    if (r.rcx > r.rsi || !r.rdx) { if (auto* d = Ptr(r.rdi, r.rsi)) memset(d, 0, r.rsi); Ret(r, r.rdx ? 34 : 22); return; }
+    auto* d = Ptr(r.rdi, r.rcx);
+    auto* src = Ptr(r.rdx, r.rcx);
+    if (d && src) memmove(d, src, r.rcx);
+    r.rax = 0;
+}
+void StrcpyS(X86Regs& r) {  // (dst, dst_size, src)
+    const size_t n = StrLen(r.rdx);
+    if (!r.rdi || !r.rsi) { Ret(r, 22); return; }
+    if (n >= r.rsi) { Wr<uint8_t>(r.rdi, 0); Ret(r, 34); return; }
+    PutStr(r.rdi, r.rsi, Str(r.rdx, n + 1));
+    r.rax = 0;
+}
+void SnprintfS(X86Regs& r) {  // (dst, size, format, ...) like snprintf
+    RegArgs a(r, 3);
+    std::string out = Format(r.rdx, a);
+    PutStr(r.rdi, r.rsi, out);
+    Ret(r, (int64_t)out.size());
+}
+// sscanf with the common conversions: d i u x o c s [ n p f e g a, with hh h l ll z j t L sizes and *.
+void Sscanf(X86Regs& r) {
+    RegArgs a(r, 2);
+    const std::string fmt = Str(r.rsi);
+    uint64_t in = r.rdi;
+    auto peek = [&]() { return Rd<uint8_t>(in); };
+    int assigned = 0;
+    bool any_input = false;
+    for (size_t i = 0; i < fmt.size(); i++) {
+        const char f = fmt[i];
+        if (isspace((uint8_t)f)) { while (isspace(peek())) in++; continue; }
+        if (f != '%' || (i + 1 < fmt.size() && fmt[i + 1] == '%')) {
+            if (f == '%') i++;
+            if (peek() != (uint8_t)fmt[i]) break;
+            in++;
+            continue;
+        }
+        i++;
+        const bool skip = i < fmt.size() && fmt[i] == '*';
+        if (skip) i++;
+        int width = 0;
+        while (i < fmt.size() && isdigit((uint8_t)fmt[i])) width = width * 10 + (fmt[i++] - '0');
+        int size = 4;  // bytes stored for integers: hh 1, h 2, (none) 4, l ll z j t 8
+        bool long_double = false;
+        while (i < fmt.size() && strchr("hlzjtLq", fmt[i])) {
+            const char m = fmt[i++];
+            if (m == 'h') size = size == 2 ? 1 : 2;
+            else if (m == 'L') long_double = true;
+            else size = 8;
+        }
+        if (i >= fmt.size()) break;
+        const char conv = fmt[i];
+        if (conv == 'n') { if (!skip) Wr<int32_t>(a.Int(), (int32_t)(in - r.rdi)); continue; }
+        if (conv != 'c' && conv != '[') while (isspace(peek())) in++;
+        if (!peek()) { if (!any_input) assigned = -1; break; }
+        const int limit = width ? width : INT32_MAX;
+        std::string tok;
+        if (conv == 'c') {
+            for (int k = 0; k < (width ? width : 1) && peek(); k++) tok += (char)Rd<uint8_t>(in++);
+            if (!skip) { const uint64_t dst = a.Int(); if (auto* d = Ptr(dst, tok.size())) memcpy(d, tok.data(), tok.size()); assigned++; }
+            any_input = true;
+            continue;
+        }
+        if (conv == 's' || conv == '[') {
+            std::string set;
+            bool negate = false;
+            if (conv == '[') {
+                i++;
+                if (i < fmt.size() && fmt[i] == '^') { negate = true; i++; }
+                if (i < fmt.size() && fmt[i] == ']') set += fmt[i++];
+                while (i < fmt.size() && fmt[i] != ']') set += fmt[i++];
+            }
+            while (peek() && (int)tok.size() < limit) {
+                const char c = (char)peek();
+                const bool ok = conv == 's' ? !isspace((uint8_t)c) : ((set.find(c) != std::string::npos) != negate);
+                if (!ok) break;
+                tok += c;
+                in++;
+            }
+            if (tok.empty()) break;
+            if (!skip) { PutStr(a.Int(), tok.size() + 1, tok); assigned++; }
+            any_input = true;
+            continue;
+        }
+        // numbers: take the longest prefix strtoll/strtod accept (bounded by the width)
+        std::string avail;
+        for (int k = 0; k < limit && k < 512 && Rd<uint8_t>(in + k); k++) avail += (char)Rd<uint8_t>(in + k);
+        char* end = nullptr;
+        if (strchr("eEfgGaA", conv)) {
+            const double v = strtod(avail.c_str(), &end);
+            if (end == avail.c_str()) break;
+            if (!skip) {
+                const uint64_t dst = a.Int();
+                if (size == 8 || long_double) Wr<double>(dst, v); else Wr<float>(dst, (float)v);
+                assigned++;
+            }
+        } else if (strchr("diuxXop", conv)) {
+            const int base = conv == 'd' || conv == 'u' ? 10 : conv == 'i' ? 0 : conv == 'o' ? 8 : 16;
+            const uint64_t v = conv == 'd' || conv == 'i' ? (uint64_t)strtoll(avail.c_str(), &end, base)
+                                                         : strtoull(avail.c_str(), &end, base);
+            if (end == avail.c_str()) break;
+            if (!skip) {
+                const uint64_t dst = a.Int();
+                const int n = conv == 'p' ? 8 : size;
+                if (n == 1) Wr<uint8_t>(dst, (uint8_t)v);
+                else if (n == 2) Wr<uint16_t>(dst, (uint16_t)v);
+                else if (n == 4) Wr<uint32_t>(dst, (uint32_t)v);
+                else Wr<uint64_t>(dst, v);
+                assigned++;
+            }
+        } else {
+            break;
+        }
+        in += (uint64_t)(end - avail.c_str());
+        any_input = true;
+    }
+    Ret(r, assigned);
+}
+
+// libc: math helpers and Dinkumware internals
+void Sincosf(X86Regs& r) { const float x = F(r, 0); Wr<float>(r.rdi, sinf(x)); Wr<float>(r.rsi, cosf(x)); }
+void Sincos(X86Regs& r) { const double x = D(r, 0); Wr<double>(r.rdi, sin(x)); Wr<double>(r.rsi, cos(x)); }
+void IsNan(X86Regs& r) { r.rax = std::isnan(D(r, 0)); }
+void IsNanF(X86Regs& r) { r.rax = std::isnan(F(r, 0)); }
+void IsInf(X86Regs& r) { r.rax = std::isinf(D(r, 0)); }
+void IsFinite(X86Regs& r) { r.rax = std::isfinite(D(r, 0)); }
+void IsFiniteF(X86Regs& r) { r.rax = std::isfinite(F(r, 0)); }
+void Logb(X86Regs& r) { RetD(r, logb(D(r, 0))); }
+void Scalbn(X86Regs& r) { RetD(r, scalbn(D(r, 0), (int)r.rdi)); }
+void Nearbyintf(X86Regs& r) { RetF(r, nearbyintf(F(r, 0))); }
+void Cosh(X86Regs& r) { RetD(r, D(r, 1) * cosh(D(r, 0))); }  // _Cosh(x, y) = y * cosh(x)
+void Sinh(X86Regs& r) { RetD(r, D(r, 1) * sinh(D(r, 0))); }  // _Sinh(x, y) = y * sinh(x)
+void Dtest(X86Regs& r) {  // classifies *p: 2 NaN, 1 infinite, -1 finite, -2 denormal, 0 zero
+    const double v = Rd<double>(r.rdi);
+    Ret(r, std::isnan(v) ? 2 : std::isinf(v) ? 1 : v == 0 ? 0 : std::fpclassify(v) == FP_SUBNORMAL ? -2 : -1);
+}
+void Powidf2(X86Regs& r) {  // compiler-rt: a ** b for an integer b
+    double a = D(r, 0), result = 1;
+    int b = (int)r.rdi;
+    const bool recip = b < 0;
+    for (unsigned e = recip ? -(unsigned)b : (unsigned)b; e; e >>= 1, a *= a)
+        if (e & 1) result *= a;
+    RetD(r, recip ? 1 / result : result);
+}
+void Udivti3(X86Regs& r) {  // compiler-rt: unsigned 128-bit a / b, a in rdi:rsi and b in rdx:rcx
+    const unsigned __int128 a = ((unsigned __int128)r.rsi << 64) | r.rdi, b = ((unsigned __int128)r.rcx << 64) | r.rdx;
+    const unsigned __int128 q = b ? a / b : 0;
+    r.rax = (uint64_t)q;
+    r.rdx = (uint64_t)(q >> 64);
+}
+// Dinkumware atomics: (object, value, memory order) -> the previous value. Guest threads don't preempt each other.
+void AtomicFetchAdd4(X86Regs& r) { const uint32_t v = Rd<uint32_t>(r.rdi); Wr<uint32_t>(r.rdi, v + (uint32_t)r.rsi); r.rax = v; }
+void AtomicFetchSub4(X86Regs& r) { const uint32_t v = Rd<uint32_t>(r.rdi); Wr<uint32_t>(r.rdi, v - (uint32_t)r.rsi); r.rax = v; }
+// C11 threads (Dinkumware): _Mtx_init(_Mtx_t*, type) and _Cnd_init(_Cnd_t*) give each object a handle.
+void MtxInit(X86Regs& r) { Wr<uint64_t>(r.rdi, g_heap.Alloc(64, 16)); r.rax = 0; }
+void CndInit(X86Regs& r) { Wr<uint64_t>(r.rdi, g_heap.Alloc(64, 16)); r.rax = 0; }
+
+// setjmp(buf) saves the callee-saved registers, the stack pointer and the return address; longjmp(buf, v)
+// restores them, so setjmp returns again with v (or 1).
+void Setjmp(X86Regs& r) {
+    const uint64_t regs[8] = {r.rbx, r.rbp, r.r12, r.r13, r.r14, r.r15, r.rsp + 8, Rd<uint64_t>(r.rsp)};
+    for (int i = 0; i < 8; i++) Wr<uint64_t>(r.rdi + 8 * i, regs[i]);
+    r.rax = 0;
+}
+void Longjmp(X86Regs& r) {
+    const uint64_t buf = r.rdi, value = (uint32_t)r.rsi ? (uint32_t)r.rsi : 1;
+    r.rbx = Rd<uint64_t>(buf); r.rbp = Rd<uint64_t>(buf + 8);
+    r.r12 = Rd<uint64_t>(buf + 16); r.r13 = Rd<uint64_t>(buf + 24);
+    r.r14 = Rd<uint64_t>(buf + 32); r.r15 = Rd<uint64_t>(buf + 40);
+    r.rsp = Rd<uint64_t>(buf + 48);
+    r.rip = Rd<uint64_t>(buf + 56);
+    r.rax = value;
+    L.cpu->RequestYield(true);  // continue at the setjmp return address, not at the stub's RET
+}
 
 // libc: sorting with guest comparators
 void Qsort(X86Regs& r) {
@@ -1961,6 +2196,15 @@ const Impl kImpls[] = {
     {"sceNpGetAccountIdA", NpGetAccountId},
     {"sceKernelDlsym", Dlsym},
     {"scePadOpen", ReturnHandle1}, {"scePadInit", RetZero},
+    {"strcasecmp", Strcasecmp}, {"strncasecmp", Strncasecmp}, {"strlcpy", Strlcpy}, {"strspn", Strspn},
+    {"strerror", Strerror}, {"memcpy_s", MemcpyS}, {"strcpy_s", StrcpyS}, {"snprintf_s", SnprintfS},
+    {"sprintf_s", SnprintfS}, {"sscanf", Sscanf},
+    {"sincosf", Sincosf}, {"sincos", Sincos}, {"__isnan", IsNan}, {"__isnanf", IsNanF}, {"__isinf", IsInf},
+    {"__isfinite", IsFinite}, {"__isfinitef", IsFiniteF}, {"logb", Logb}, {"scalbn", Scalbn},
+    {"nearbyintf", Nearbyintf}, {"_Cosh", Cosh}, {"_Sinh", Sinh}, {"_Dtest", Dtest}, {"__powidf2", Powidf2},
+    {"__udivti3", Udivti3}, {"_Atomic_fetch_add_4", AtomicFetchAdd4}, {"_Atomic_fetch_sub_4", AtomicFetchSub4},
+    {"_Mtx_init", MtxInit}, {"_Cnd_init", CndInit}, {"_Mtx_destroy", RetZero}, {"_Cnd_destroy", RetZero},
+    {"setjmp", Setjmp}, {"longjmp", Longjmp},
     {"sceKernelInstallExceptionHandler", InstallExceptionHandler},
     {"sceKernelRemoveExceptionHandler", RemoveExceptionHandler}, {"sceKernelRaiseException", RaiseException},
     {"sceAudioOutInit", RetZero}, {"sceAudioOutOpen", AudioOutOpen}, {"sceAudioOutClose", AudioOutClose},
