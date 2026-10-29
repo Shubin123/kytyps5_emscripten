@@ -127,7 +127,14 @@ private:
     void SetSF(bool v) { regs_.rflags = (regs_.rflags & ~(1ULL << 7)) | ((uint64_t)v << 7); }
     void SetOF(bool v) { regs_.rflags = (regs_.rflags & ~(1ULL << 11)) | ((uint64_t)v << 11); }
 
-    uint64_t& RegByIndex(int idx);
+    // General registers by encoding number (rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8-r15); 16-19 are AH-BH.
+    uint64_t& RegByIndex(int idx) {
+        static constexpr uint8_t kOffset[16] = {0, 16, 24, 8, 56, 48, 32, 40, 64, 72, 80, 88, 96, 104, 112, 120};
+        if (__builtin_expect(idx < 16, 1))
+            return *reinterpret_cast<uint64_t*>(reinterpret_cast<char*>(&regs_) + kOffset[idx & 15]);
+        return HighByteReg(idx);
+    }
+    uint64_t& HighByteReg(int idx);
     uint64_t ResolveModRM(uint8_t modrm, uint8_t* sib_out, int addr_size, int* disp_bytes);
 
     X86Regs regs_;

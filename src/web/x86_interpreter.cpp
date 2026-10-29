@@ -1,4 +1,6 @@
 #include "x86_interpreter.h"
+
+#include <cstddef>
 #include <cstring>
 #include <cstdio>
 #include <cmath>
@@ -309,7 +311,11 @@ uint64_t X86Interpreter::Pop64() {
     return val;
 }
 
-uint64_t& X86Interpreter::RegByIndex(int idx) {
+static_assert(offsetof(X86Regs, rcx) == 16 && offsetof(X86Regs, rbx) == 8 && offsetof(X86Regs, rsp) == 56 &&
+              offsetof(X86Regs, rsi) == 32 && offsetof(X86Regs, r8) == 64 && offsetof(X86Regs, r15) == 120,
+              "RegByIndex's offsets follow X86Regs");
+
+uint64_t& X86Interpreter::HighByteReg(int idx) {
     if (idx >= 16 && idx < 20) {  // AH, CH, DH, BH: bits 15:8 of RAX/RCX/RDX/RBX, written back after the step
         const int k = idx - 16;
         if (!(high8_used_ & (1 << k))) {
@@ -318,25 +324,7 @@ uint64_t& X86Interpreter::RegByIndex(int idx) {
         }
         return high8_[k];
     }
-    switch (idx & 0xF) {
-        case 0:  return regs_.rax;
-        case 1:  return regs_.rcx;
-        case 2:  return regs_.rdx;
-        case 3:  return regs_.rbx;
-        case 4:  return regs_.rsp;
-        case 5:  return regs_.rbp;
-        case 6:  return regs_.rsi;
-        case 7:  return regs_.rdi;
-        case 8:  return regs_.r8;
-        case 9:  return regs_.r9;
-        case 10: return regs_.r10;
-        case 11: return regs_.r11;
-        case 12: return regs_.r12;
-        case 13: return regs_.r13;
-        case 14: return regs_.r14;
-        case 15: return regs_.r15;
-    }
-    return regs_.rax;
+    return RegByIndex(idx & 15);
 }
 
 void X86Interpreter::UpdateFlags(uint64_t result, int bits) {
