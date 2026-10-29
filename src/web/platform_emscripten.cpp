@@ -11,8 +11,10 @@
 #include <string>
 #include <vector>
 
+#ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #include <emscripten/threading.h>
+#endif
 
 // Kyty platform headers — we provide the implementations that upstream expects.
 // The KYTY_PLATFORM_EMSCRIPTEN guard steers upstream headers to our stubs.
@@ -152,7 +154,9 @@ bool sys_is_debugger_present() {
 }
 
 void sys_debug_break() {
+#ifdef __EMSCRIPTEN__
     emscripten_debugger();
+#endif
 }
 
 } // namespace Kyty::Core
