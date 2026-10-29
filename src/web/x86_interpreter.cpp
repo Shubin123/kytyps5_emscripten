@@ -340,12 +340,46 @@ X86Exception X86Interpreter::DecodeAndExecute() {
 
     (void)has_lock;
     (void)has_addr_size;
-    (void)seg_override;
+    const uint64_t seg_base = seg_override == 0x64 ? regs_.fs_base
+                            : seg_override == 0x65 ? regs_.gs_base : 0;
 
     int op_size = rex_w ? 64 : (has_op_size ? 16 : 32);
     int op_bytes = op_size / 8;
 
     uint8_t opcode = ReadMemory8(regs_.rip++);
+
+    // Opcode map (0 = one-byte, 1 = 0F, 2 = 0F38, 3 = 0F3A) and opcode, for sizing immediates.
+    int cur_map = 0;
+    uint8_t cur_op = opcode;
+    // VEX fields. Legacy SSE encodings reuse the VEX handlers with the destination as first source.
+    int vex_R = 1, vex_X = 1, vex_B = 1, vex_W = 0, vex_L = 0, vex_pp = 0, vex_vvvv = 0, vex_mmmmm = 1;
+    uint8_t vex_opcode = 0;
+    bool legacy_simd = false;
+    // Added to memory operands while executing the upper 128-bit lane of a 256-bit instruction.
+    uint64_t lane_mem_offset = 0;
+
+    // RIP-relative addresses are relative to the end of the instruction, including any immediate.
+    auto imm_bytes_after_modrm = [&](uint8_t modrm) -> int {
+        const int reg = (modrm >> 3) & 7;
+        const int z = op_size == 16 ? 2 : 4;
+        if (cur_map == 0) {
+            switch (cur_op) {
+                case 0x80: case 0x82: case 0x83: case 0xC0: case 0xC1: case 0xC6: case 0x6B: return 1;
+                case 0x81: case 0xC7: case 0x69: return z;
+                case 0xF6: return reg < 2 ? 1 : 0;
+                case 0xF7: return reg < 2 ? z : 0;
+                default: return 0;
+            }
+        }
+        if (cur_map == 1) {
+            switch (cur_op) {
+                case 0x70: case 0x71: case 0x72: case 0x73: case 0xA4: case 0xAC: case 0xBA:
+                case 0xC2: case 0xC4: case 0xC5: case 0xC6: return 1;
+                default: return 0;
+            }
+        }
+        return cur_map == 3 ? 1 : 0;
+    };
 
     // Helper lambdas for reading ModRM operands
     auto read_modrm = [&]() -> uint8_t {
@@ -403,8 +437,8 @@ X86Exception X86Interpreter::DecodeAndExecute() {
             }
         } else if (rm_raw == 5 && mod == 0) {
             int32_t d32 = fetch_disp32();
-            ea = regs_.rip + (int64_t)d32;
-            *addr_out = ea;
+            ea = regs_.rip + (int64_t)d32 + imm_bytes_after_modrm(modrm);
+            *addr_out = ea + seg_base + lane_mem_offset;
             return;
         } else {
             ea = RegByIndex(rm_raw | (rex_b << 3));
@@ -417,7 +451,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
             int32_t d32 = fetch_disp32();
             ea += (int64_t)d32;
         }
-        *addr_out = ea;
+        *addr_out = ea + seg_base + lane_mem_offset;
     };
 
     // Read value from rm operand
@@ -1074,14 +1108,14 @@ X86Exception X86Interpreter::DecodeAndExecute() {
 
     // 0xA0: MOV AL, moffs8
     case 0xA0: {
-        uint64_t addr = (rex_w || !has_addr_size) ? read_imm64() : read_imm32();
+        uint64_t addr = ((rex_w || !has_addr_size) ? read_imm64() : read_imm32()) + seg_base;
         regs_.rax = (regs_.rax & ~0xFFULL) | ReadMemory8(addr);
         break;
     }
 
     // 0xA1: MOV rAX, moffs
     case 0xA1: {
-        uint64_t addr = (rex_w || !has_addr_size) ? read_imm64() : read_imm32();
+        uint64_t addr = ((rex_w || !has_addr_size) ? read_imm64() : read_imm32()) + seg_base;
         if (op_size == 64) regs_.rax = ReadMemory64(addr);
         else if (op_size == 16) regs_.rax = (regs_.rax & ~0xFFFFULL) | ReadMemory16(addr);
         else regs_.rax = ReadMemory32(addr);
@@ -1090,14 +1124,14 @@ X86Exception X86Interpreter::DecodeAndExecute() {
 
     // 0xA2: MOV moffs8, AL
     case 0xA2: {
-        uint64_t addr = (rex_w || !has_addr_size) ? read_imm64() : read_imm32();
+        uint64_t addr = ((rex_w || !has_addr_size) ? read_imm64() : read_imm32()) + seg_base;
         WriteMemory8(addr, (uint8_t)regs_.rax);
         break;
     }
 
     // 0xA3: MOV moffs, rAX
     case 0xA3: {
-        uint64_t addr = (rex_w || !has_addr_size) ? read_imm64() : read_imm32();
+        uint64_t addr = ((rex_w || !has_addr_size) ? read_imm64() : read_imm32()) + seg_base;
         if (op_size == 64) WriteMemory64(addr, regs_.rax);
         else if (op_size == 16) WriteMemory16(addr, (uint16_t)regs_.rax);
         else WriteMemory32(addr, (uint32_t)regs_.rax);
@@ -1775,6 +1809,14 @@ X86Exception X86Interpreter::DecodeAndExecute() {
     // --- Two-byte opcodes (0x0F prefix) ---
     case 0x0F: {
         uint8_t op2 = ReadMemory8(regs_.rip++);
+        cur_map = 1;
+        cur_op = op2;
+        auto set_reg_bits = [&](int idx, uint64_t v, int bits) {
+            uint64_t& r = RegByIndex(idx);
+            if (bits == 64) r = v;
+            else if (bits == 32) r = (uint32_t)v;
+            else { uint64_t m = (1ULL << bits) - 1; r = (r & ~m) | (v & m); }
+        };
         switch (op2) {
 
         // 0x0F 0x05: SYSCALL
@@ -2067,7 +2109,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
             break;
         }
 
-        // 0x0F 0xBC: BSF r, r/m
+        // 0x0F 0xBC: BSF r, r/m  (F3: TZCNT)
         case 0xBC: {
             uint8_t modrm = read_modrm();
             uint64_t rm_addr; bool rm_is_reg;
@@ -2075,6 +2117,13 @@ X86Exception X86Interpreter::DecodeAndExecute() {
             int reg = reg_field(modrm);
             uint64_t val = read_from_rm(rm_addr, rm_is_reg, op_size);
             val = truncate(val, op_size);
+            if (has_rep) {
+                uint64_t cnt = val ? (uint64_t)__builtin_ctzll(val) : (uint64_t)op_size;
+                set_reg_bits(reg, cnt, op_size);
+                SetCF(val == 0);
+                SetZF(cnt == 0);
+                break;
+            }
             if (val == 0) {
                 SetZF(true);
             } else {
@@ -2087,7 +2136,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
             break;
         }
 
-        // 0x0F 0xBD: BSR r, r/m
+        // 0x0F 0xBD: BSR r, r/m  (F3: LZCNT)
         case 0xBD: {
             uint8_t modrm = read_modrm();
             uint64_t rm_addr; bool rm_is_reg;
@@ -2095,6 +2144,13 @@ X86Exception X86Interpreter::DecodeAndExecute() {
             int reg = reg_field(modrm);
             uint64_t val = read_from_rm(rm_addr, rm_is_reg, op_size);
             val = truncate(val, op_size);
+            if (has_rep) {
+                uint64_t cnt = val ? (uint64_t)(__builtin_clzll(val) - (64 - op_size)) : (uint64_t)op_size;
+                set_reg_bits(reg, cnt, op_size);
+                SetCF(val == 0);
+                SetZF(cnt == 0);
+                break;
+            }
             if (val == 0) {
                 SetZF(true);
             } else {
@@ -2219,10 +2275,152 @@ X86Exception X86Interpreter::DecodeAndExecute() {
             break;
         }
 
-        default:
-            fprintf(stderr, "[x86] Unimplemented 0F opcode: 0x%02X at RIP=0x%llX\n", op2,
-                    (unsigned long long)(regs_.rip - 2));
-            return X86Exception::InvalidOpcode;
+        // Prefetch and hint NOPs (incl. ENDBR64)
+        case 0x0D: case 0x18: case 0x19: case 0x1A: case 0x1B: case 0x1C: case 0x1D: case 0x1E: {
+            uint8_t modrm = read_modrm();
+            uint64_t rm_addr; bool rm_is_reg;
+            decode_rm(modrm, &rm_addr, &rm_is_reg);
+            break;
+        }
+
+        // SHLD (A4 imm8, A5 CL) / SHRD (AC imm8, AD CL)
+        case 0xA4: case 0xA5: case 0xAC: case 0xAD: {
+            uint8_t modrm = read_modrm();
+            uint64_t rm_addr; bool rm_is_reg;
+            decode_rm(modrm, &rm_addr, &rm_is_reg);
+            unsigned cnt = (op2 & 1) ? (unsigned)(regs_.rcx & 0xFF) : read_imm8();
+            cnt &= op_size == 64 ? 63 : 31;
+            if (cnt && cnt < (unsigned)op_size) {
+                uint64_t dst = read_from_rm(rm_addr, rm_is_reg, op_size);
+                uint64_t src = truncate(RegByIndex(reg_field(modrm)), op_size);
+                uint64_t res;
+                if (op2 <= 0xA5) {
+                    res = truncate((dst << cnt) | (src >> (op_size - cnt)), op_size);
+                    SetCF((dst >> (op_size - cnt)) & 1);
+                } else {
+                    res = truncate((dst >> cnt) | (src << (op_size - cnt)), op_size);
+                    SetCF((dst >> (cnt - 1)) & 1);
+                }
+                write_to_rm(rm_addr, rm_is_reg, res, op_size);
+                UpdateFlags(res, op_size);
+            }
+            break;
+        }
+
+        // Group 15: fences, LDMXCSR/STMXCSR, CLFLUSH
+        case 0xAE: {
+            uint8_t modrm = read_modrm();
+            int sub = (modrm >> 3) & 7;
+            uint64_t rm_addr; bool rm_is_reg;
+            decode_rm(modrm, &rm_addr, &rm_is_reg);
+            if (rm_is_reg) {
+                if (sub < 5) return X86Exception::InvalidOpcode;  // RDFSBASE etc.
+            } else if (sub == 3) {
+                WriteMemory32(rm_addr, 0x1F80);                    // STMXCSR: default MXCSR
+            } else if (sub != 2 && sub != 7) {
+                fprintf(stderr, "[x86] Unimplemented 0F AE /%d at RIP=0x%llX\n", sub, (unsigned long long)regs_.rip);
+                return X86Exception::InvalidOpcode;
+            }
+            break;
+        }
+
+        // CMPXCHG r/m8, r8 (B0) / r/m, r (B1)
+        case 0xB0: case 0xB1: {
+            int bits = op2 == 0xB0 ? 8 : op_size;
+            uint8_t modrm = read_modrm();
+            uint64_t rm_addr; bool rm_is_reg;
+            decode_rm(modrm, &rm_addr, &rm_is_reg);
+            uint64_t dst = read_from_rm(rm_addr, rm_is_reg, bits);
+            uint64_t acc = truncate(regs_.rax, bits);
+            UpdateFlagsSub(acc, dst, acc - dst, bits);
+            if (acc == dst) write_to_rm(rm_addr, rm_is_reg, truncate(RegByIndex(reg_field(modrm)), bits), bits);
+            else set_reg_bits(0, dst, bits);
+            break;
+        }
+
+        // POPCNT (F3 0F B8)
+        case 0xB8: {
+            if (!has_rep) return X86Exception::InvalidOpcode;
+            uint8_t modrm = read_modrm();
+            uint64_t rm_addr; bool rm_is_reg;
+            decode_rm(modrm, &rm_addr, &rm_is_reg);
+            uint64_t val = read_from_rm(rm_addr, rm_is_reg, op_size);
+            set_reg_bits(reg_field(modrm), (uint64_t)__builtin_popcountll(val), op_size);
+            regs_.rflags &= ~0x8D5ULL;  // clear OF SF ZF AF PF CF
+            SetZF(val == 0);
+            break;
+        }
+
+        // BTC r/m, r
+        case 0xBB: {
+            uint8_t modrm = read_modrm();
+            uint64_t rm_addr; bool rm_is_reg;
+            decode_rm(modrm, &rm_addr, &rm_is_reg);
+            uint64_t val = read_from_rm(rm_addr, rm_is_reg, op_size);
+            int bit = truncate(RegByIndex(reg_field(modrm)), op_size) % op_size;
+            SetCF((val >> bit) & 1);
+            write_to_rm(rm_addr, rm_is_reg, truncate(val ^ (1ULL << bit), op_size), op_size);
+            break;
+        }
+
+        // XADD r/m8, r8 (C0) / r/m, r (C1)
+        case 0xC0: case 0xC1: {
+            int bits = op2 == 0xC0 ? 8 : op_size;
+            uint8_t modrm = read_modrm();
+            uint64_t rm_addr; bool rm_is_reg;
+            decode_rm(modrm, &rm_addr, &rm_is_reg);
+            int reg = reg_field(modrm);
+            uint64_t dst = read_from_rm(rm_addr, rm_is_reg, bits);
+            uint64_t src = truncate(RegByIndex(reg), bits);
+            uint64_t sum = truncate(dst + src, bits);
+            UpdateFlagsAdd(dst, src, dst + src, bits);
+            set_reg_bits(reg, dst, bits);
+            write_to_rm(rm_addr, rm_is_reg, sum, bits);
+            break;
+        }
+
+        // MOVNTI m, r
+        case 0xC3: {
+            uint8_t modrm = read_modrm();
+            uint64_t rm_addr; bool rm_is_reg;
+            decode_rm(modrm, &rm_addr, &rm_is_reg);
+            write_to_rm(rm_addr, rm_is_reg, truncate(RegByIndex(reg_field(modrm)), op_size), op_size);
+            break;
+        }
+
+        default: {
+            // SSE encodings are the VEX forms with the destination as the first source operand.
+            const bool sse = (op2 >= 0x10 && op2 <= 0x17) || (op2 >= 0x28 && op2 <= 0x2F) ||
+                             (op2 >= 0x50 && op2 <= 0x7F) || (op2 >= 0xC2 && op2 <= 0xC6) ||
+                             op2 >= 0xD0 || op2 == 0x38 || op2 == 0x3A;
+            const int pp = has_op_size ? 1 : has_rep ? 2 : has_repne ? 3 : 0;
+            const bool mmx = pp == 0 && ((op2 >= 0x60 && op2 <= 0x7F) || op2 >= 0xD0);
+            if (!sse || mmx) {
+                fprintf(stderr, "[x86] Unimplemented 0F opcode: 0x%02X at RIP=0x%llX\n", op2,
+                        (unsigned long long)(regs_.rip - 2));
+                return X86Exception::InvalidOpcode;
+            }
+            vex_mmmmm = 1;
+            vex_opcode = op2;
+            if (op2 == 0x38 || op2 == 0x3A) {
+                vex_mmmmm = op2 == 0x38 ? 2 : 3;
+                vex_opcode = ReadMemory8(regs_.rip++);
+                if (vex_opcode >= 0xF0) {  // CRC32/MOVBE/ADCX are not SIMD
+                    fprintf(stderr, "[x86] Unimplemented 0F %02X %02X at RIP=0x%llX\n", op2, vex_opcode,
+                            (unsigned long long)(regs_.rip - 3));
+                    return X86Exception::InvalidOpcode;
+                }
+            }
+            // Immediate-count shifts (0F 71-73) take their destination from ModRM.rm, everything else from ModRM.reg.
+            const uint8_t modrm_peek = ReadMemory8(regs_.rip);
+            const bool rm_dest = vex_mmmmm == 1 && op2 >= 0x71 && op2 <= 0x73;
+            vex_vvvv = rm_dest ? ((modrm_peek & 7) | (rex_b << 3)) : (((modrm_peek >> 3) & 7) | (rex_r << 3));
+            vex_pp = pp;
+            vex_W = rex_w;
+            vex_L = 0;
+            legacy_simd = true;
+            goto simd_dispatch;
+        }
         }
         break;
     } // end 0x0F
@@ -2277,11 +2475,6 @@ X86Exception X86Interpreter::DecodeAndExecute() {
     // --- VEX-encoded instructions (AVX) ---
     case 0xC5: case 0xC4: {
         // VEX prefix decoding
-        int vex_R = 1, vex_X = 1, vex_B = 1;
-        int vex_W = 0, vex_L = 0, vex_pp = 0, vex_vvvv = 0;
-        int vex_mmmmm = 1; // default 0F map
-        uint8_t vex_opcode;
-
         if (opcode == 0xC5) {
             // 2-byte VEX: C5 [RvvvvLpp]
             uint8_t b1 = ReadMemory8(regs_.rip++);
@@ -2312,12 +2505,217 @@ X86Exception X86Interpreter::DecodeAndExecute() {
         rex_w = vex_W;
         rex = true;
 
+    simd_dispatch:
+        cur_map = vex_mmmmm;
+        cur_op = vex_opcode;
         // VEX.pp maps to legacy prefix: 0=none, 1=66, 2=F3, 3=F2
         bool vex_66 = (vex_pp == 1);
         bool vex_f3 = (vex_pp == 2);
         bool vex_f2 = (vex_pp == 3);
         (void)vex_66; (void)vex_f2;
         int vec_len = vex_L ? 32 : 16; // YMM (256) or XMM (128)
+
+        const uint64_t operand_rip = regs_.rip;
+        const uint8_t op_modrm = ReadMemory8(operand_rip);
+        const int op_reg = ((op_modrm >> 3) & 7) | (rex_r << 3);
+        const int op_rm = (op_modrm & 7) | (rex_b << 3);
+        const bool op_rm_is_reg = (op_modrm >> 6) == 3;
+
+        // Forms that move data across 128-bit lanes (or change width) are handled whole here.
+        if (!legacy_simd) {
+            auto mem_in = [&](uint64_t a, uint8_t* out, size_t n) {
+                uint64_t off = a - mem_base_addr_;
+                if (a >= mem_base_addr_ && off + n <= mem_size_) memcpy(out, mem_base_ + off, n);
+                else memset(out, 0, n);
+            };
+            auto mem_out = [&](uint64_t a, const uint8_t* in, size_t n) {
+                uint64_t off = a - mem_base_addr_;
+                if (a >= mem_base_addr_ && off + n <= mem_size_) memcpy(mem_base_ + off, in, n);
+            };
+            auto ymm_get = [&](int r, uint8_t* out) {
+                memcpy(out, regs_.xmm[r & 15], 16);
+                memcpy(out + 16, regs_.ymm_hi[r & 15], 16);
+            };
+            auto ymm_set = [&](int r, const uint8_t* in, bool wide) {
+                memcpy(regs_.xmm[r & 15], in, 16);
+                if (wide) memcpy(regs_.ymm_hi[r & 15], in + 16, 16);
+                else memset(regs_.ymm_hi[r & 15], 0, 16);
+            };
+            const int width = vex_L ? 32 : 16;
+            const uint8_t op = vex_opcode;
+            bool handled = true;
+            if (vex_mmmmm == 1 && op == 0x77) {  // VZEROUPPER / VZEROALL
+                for (int i = 0; i < 16; i++) {
+                    memset(regs_.ymm_hi[i], 0, 16);
+                    if (vex_L) memset(regs_.xmm[i], 0, 16);
+                }
+            } else if (vex_mmmmm == 2 && (op == 0x18 || op == 0x19 || op == 0x1A || op == 0x58 ||
+                                          op == 0x59 || op == 0x5A || op == 0x78 || op == 0x79)) {
+                // VBROADCASTSS/SD/F128, VPBROADCASTB/W/D/Q/I128
+                uint8_t modrm = read_modrm(); uint64_t a; bool is_reg; decode_rm(modrm, &a, &is_reg);
+                int esz = op == 0x78 ? 1 : op == 0x79 ? 2 : (op == 0x18 || op == 0x58) ? 4
+                        : (op == 0x19 || op == 0x59) ? 8 : 16;
+                uint8_t src[16] = {}, out[32] = {};
+                if (is_reg) memcpy(src, regs_.xmm[(int)a & 15], 16); else mem_in(a, src, esz);
+                for (int i = 0; i < width; i += esz) memcpy(out + i, src, esz);
+                ymm_set(reg_field(modrm), out, vex_L);
+            } else if (vex_mmmmm == 2 && (op == 0x0E || op == 0x0F || op == 0x17)) {
+                // VTESTPS/VTESTPD test sign bits; VPTEST tests every bit
+                uint8_t modrm = read_modrm(); uint64_t a; bool is_reg; decode_rm(modrm, &a, &is_reg);
+                uint8_t d[32] = {}, s[32] = {};
+                ymm_get(reg_field(modrm), d);
+                if (is_reg) ymm_get((int)a, s); else mem_in(a, s, width);
+                const int esz = op == 0x0E ? 4 : op == 0x0F ? 8 : 1;
+                const uint8_t mask = op == 0x17 ? 0xFF : 0x80;
+                bool zf = true, cf = true;
+                for (int i = 0; i < width; i += esz) {
+                    int b = i + esz - 1;
+                    if (d[b] & s[b] & mask) zf = false;
+                    if (~d[b] & s[b] & mask) cf = false;
+                }
+                SetZF(zf); SetCF(cf); SetOF(false); SetSF(false); SetAF(false); SetPF(false);
+            } else if (vex_mmmmm == 2 && ((op >= 0x20 && op <= 0x25) || (op >= 0x30 && op <= 0x35))) {
+                // VPMOVSX / VPMOVZX
+                static const int kSrc[6] = {1, 1, 1, 2, 2, 4}, kDst[6] = {2, 4, 8, 4, 8, 8};
+                const int k = op & 0xF;
+                uint8_t modrm = read_modrm(); uint64_t a; bool is_reg; decode_rm(modrm, &a, &is_reg);
+                const int count = width / kDst[k];
+                uint8_t src[16] = {}, out[32] = {};
+                if (is_reg) memcpy(src, regs_.xmm[(int)a & 15], 16); else mem_in(a, src, count * kSrc[k]);
+                for (int i = 0; i < count; i++) {
+                    uint64_t v = 0;
+                    memcpy(&v, src + i * kSrc[k], kSrc[k]);
+                    if (op < 0x30) { int sh = 64 - 8 * kSrc[k]; v = (uint64_t)((int64_t)(v << sh) >> sh); }
+                    memcpy(out + i * kDst[k], &v, kDst[k]);
+                }
+                ymm_set(reg_field(modrm), out, vex_L);
+            } else if (vex_mmmmm == 1 && vex_L && (op == 0x50 || op == 0xD7)) {
+                // VMOVMSKPS/PD ymm, VPMOVMSKB ymm
+                uint8_t modrm = read_modrm(); uint64_t a; bool is_reg; decode_rm(modrm, &a, &is_reg);
+                uint8_t s[32];
+                ymm_get((int)a, s);
+                const int esz = op == 0xD7 ? 1 : vex_pp == 1 ? 8 : 4;
+                uint32_t m = 0;
+                for (int i = 0; i < 32 / esz; i++) m |= (uint32_t)(s[i * esz + esz - 1] >> 7) << i;
+                RegByIndex(reg_field(modrm)) = m;
+            } else if (vex_mmmmm == 1 && vex_L && op == 0x5A && vex_pp <= 1) {
+                uint8_t modrm = read_modrm(); uint64_t a; bool is_reg; decode_rm(modrm, &a, &is_reg);
+                uint8_t out[32] = {};
+                if (vex_pp == 0) {  // VCVTPS2PD ymm, xmm/m128
+                    float f[4];
+                    if (is_reg) memcpy(f, regs_.xmm[(int)a & 15], 16); else mem_in(a, (uint8_t*)f, 16);
+                    for (int i = 0; i < 4; i++) { double d = f[i]; memcpy(out + i * 8, &d, 8); }
+                    ymm_set(reg_field(modrm), out, true);
+                } else {            // VCVTPD2PS xmm, ymm/m256
+                    double d[4];
+                    if (is_reg) ymm_get((int)a, (uint8_t*)d); else mem_in(a, (uint8_t*)d, 32);
+                    for (int i = 0; i < 4; i++) { float f = (float)d[i]; memcpy(out + i * 4, &f, 4); }
+                    ymm_set(reg_field(modrm), out, false);
+                }
+            } else if (vex_mmmmm == 3 && vex_L && (op == 0x18 || op == 0x38)) {
+                // VINSERTF128 / VINSERTI128
+                uint8_t modrm = read_modrm(); uint64_t a; bool is_reg; decode_rm(modrm, &a, &is_reg);
+                uint8_t imm = read_imm8();
+                uint8_t v[32], s[16];
+                ymm_get(vex_vvvv, v);
+                if (is_reg) memcpy(s, regs_.xmm[(int)a & 15], 16); else mem_in(a, s, 16);
+                memcpy(v + (imm & 1) * 16, s, 16);
+                ymm_set(reg_field(modrm), v, true);
+            } else if (vex_mmmmm == 3 && vex_L && (op == 0x19 || op == 0x39)) {
+                // VEXTRACTF128 / VEXTRACTI128
+                uint8_t modrm = read_modrm(); uint64_t a; bool is_reg; decode_rm(modrm, &a, &is_reg);
+                uint8_t imm = read_imm8();
+                uint8_t v[32], out[32] = {};
+                ymm_get(reg_field(modrm), v);
+                if (is_reg) { memcpy(out, v + (imm & 1) * 16, 16); ymm_set((int)a, out, false); }
+                else mem_out(a, v + (imm & 1) * 16, 16);
+            } else if (vex_mmmmm == 3 && vex_L && (op == 0x06 || op == 0x46)) {
+                // VPERM2F128 / VPERM2I128
+                uint8_t modrm = read_modrm(); uint64_t a; bool is_reg; decode_rm(modrm, &a, &is_reg);
+                uint8_t imm = read_imm8();
+                uint8_t s1[32], s2[32], out[32];
+                ymm_get(vex_vvvv, s1);
+                if (is_reg) ymm_get((int)a, s2); else mem_in(a, s2, 32);
+                for (int lane = 0; lane < 2; lane++) {
+                    int sel = (imm >> (lane * 4)) & 0xF;
+                    if (sel & 8) memset(out + lane * 16, 0, 16);
+                    else memcpy(out + lane * 16, ((sel & 2) ? s2 : s1) + (sel & 1) * 16, 16);
+                }
+                ymm_set(reg_field(modrm), out, true);
+            } else if (vex_mmmmm == 3 && vex_L && (op == 0x00 || op == 0x01)) {
+                // VPERMQ / VPERMPD
+                uint8_t modrm = read_modrm(); uint64_t a; bool is_reg; decode_rm(modrm, &a, &is_reg);
+                uint8_t imm = read_imm8();
+                uint64_t s[4], out[4];
+                if (is_reg) ymm_get((int)a, (uint8_t*)s); else mem_in(a, (uint8_t*)s, 32);
+                for (int i = 0; i < 4; i++) out[i] = s[(imm >> (2 * i)) & 3];
+                ymm_set(reg_field(modrm), (const uint8_t*)out, true);
+            } else if (vex_mmmmm == 2 && vex_L && (op == 0x36 || op == 0x16)) {
+                // VPERMD / VPERMPS
+                uint8_t modrm = read_modrm(); uint64_t a; bool is_reg; decode_rm(modrm, &a, &is_reg);
+                uint32_t idx[8], s[8], out[8];
+                ymm_get(vex_vvvv, (uint8_t*)idx);
+                if (is_reg) ymm_get((int)a, (uint8_t*)s); else mem_in(a, (uint8_t*)s, 32);
+                for (int i = 0; i < 8; i++) out[i] = s[idx[i] & 7];
+                ymm_set(reg_field(modrm), (const uint8_t*)out, true);
+            } else {
+                handled = false;
+            }
+            if (handled) break;
+        }
+
+        // At 256 bits, element-wise and in-lane ops run twice: the second pass sees each register's
+        // upper half and memory operands 16 bytes further on. Scalar, GPR and flag forms ignore VEX.L.
+        auto lane_wise_256 = [&]() -> int {  // 1: two lanes, 0: one pass, -1: unsupported
+            const uint8_t op = vex_opcode;
+            if (vex_mmmmm == 1) {
+                if ((vex_pp >= 2) && (op == 0x10 || op == 0x11 || op == 0x2A || op == 0x2C || op == 0x2D ||
+                                      (op >= 0x51 && op <= 0x5F) || op == 0xC2))
+                    return 0;
+                if (op == 0x2E || op == 0x2F || op == 0x6E || op == 0x7E || op == 0xC4 || op == 0xC5 || op == 0xD6)
+                    return 0;
+                if (op == 0x5A || op == 0xE6) return -1;
+                return 1;
+            }
+            if (vex_mmmmm == 2) return op >= 0xF0 ? 0 : 1;
+            if ((op >= 0x14 && op <= 0x17) || (op >= 0x20 && op <= 0x22) || op == 0xF0) return 0;
+            return 1;
+        };
+        int lanes = 1;
+        if (!legacy_simd && vex_L) {
+            int lw = lane_wise_256();
+            if (lw < 0) {
+                fprintf(stderr, "[x86] Unimplemented 256-bit form: map %d opcode 0x%02X at RIP=0x%llX\n",
+                        vex_mmmmm, vex_opcode, (unsigned long long)(operand_rip - 1));
+                return X86Exception::InvalidOpcode;
+            }
+            lanes = lw ? 2 : 1;
+        }
+        // Shifts by an XMM count use the low 64 bits of the count in both lanes.
+        const bool count_operand = vex_mmmmm == 1 &&
+            (vex_opcode == 0xD1 || vex_opcode == 0xD2 || vex_opcode == 0xD3 || vex_opcode == 0xE1 ||
+             vex_opcode == 0xE2 || vex_opcode == 0xF1 || vex_opcode == 0xF2 || vex_opcode == 0xF3);
+        uint8_t count_lo[16], count_hi[16];
+        if (lanes == 2 && count_operand && op_rm_is_reg) memcpy(count_lo, regs_.xmm[op_rm], 16);
+        auto swap_lanes = [&]() {
+            uint8_t tmp[16];
+            for (int i = 0; i < 16; i++) {
+                memcpy(tmp, regs_.xmm[i], 16);
+                memcpy(regs_.xmm[i], regs_.ymm_hi[i], 16);
+                memcpy(regs_.ymm_hi[i], tmp, 16);
+            }
+        };
+
+        for (int lane = 0; lane < lanes; lane++) {
+        if (lane == 1) {
+            swap_lanes();
+            regs_.rip = operand_rip;
+            lane_mem_offset = count_operand ? 0 : 16;
+            if (count_operand && op_rm_is_reg) {
+                memcpy(count_hi, regs_.xmm[op_rm], 16);
+                memcpy(regs_.xmm[op_rm], count_lo, 16);
+            }
+        }
 
         if (vex_mmmmm == 1) {
             // 0F opcode map (most AVX instructions)
@@ -3210,24 +3608,22 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint64_t rm_addr; bool rm_is_reg;
                 decode_rm(modrm, &rm_addr, &rm_is_reg);
                 uint8_t imm = read_imm8();
-                uint64_t data[2];
-                memcpy(data, regs_.xmm[rm_is_reg ? ((int)rm_addr & 15) : (vex_vvvv & 15)], 16);
-                for (int i = 0; i < 2; i++) {
-                    if (grp == 2) data[i] = (imm < 64) ? data[i] >> imm : 0;
-                    else if (grp == 6) data[i] = (imm < 64) ? data[i] << imm : 0;
-                    else if (grp == 3) { // VPSRLDQ (byte shift right)
-                        uint8_t tmp[16]; memcpy(tmp, data, 16);
-                        memset(regs_.xmm[vex_vvvv & 15], 0, 16);
-                        for (int j = 0; j + imm < 16; j++) regs_.xmm[vex_vvvv & 15][j] = tmp[j + imm];
-                        return X86Exception::None;
-                    } else if (grp == 7) { // VPSLLDQ (byte shift left)
-                        uint8_t tmp[16]; memcpy(tmp, data, 16);
-                        memset(regs_.xmm[vex_vvvv & 15], 0, 16);
-                        for (int j = imm; j < 16; j++) regs_.xmm[vex_vvvv & 15][j] = tmp[j - imm];
-                        return X86Exception::None;
+                uint8_t bytes[16], out[16] = {};
+                memcpy(bytes, regs_.xmm[rm_is_reg ? ((int)rm_addr & 15) : (vex_vvvv & 15)], 16);
+                if (grp == 3) {         // VPSRLDQ (byte shift right)
+                    for (int j = 0; j + imm < 16; j++) out[j] = bytes[j + imm];
+                } else if (grp == 7) {  // VPSLLDQ (byte shift left)
+                    for (int j = imm; j < 16; j++) out[j] = bytes[j - imm];
+                } else {
+                    uint64_t data[2];
+                    memcpy(data, bytes, 16);
+                    for (int i = 0; i < 2; i++) {
+                        if (grp == 2) data[i] = (imm < 64) ? data[i] >> imm : 0;
+                        else if (grp == 6) data[i] = (imm < 64) ? data[i] << imm : 0;
                     }
+                    memcpy(out, data, 16);
                 }
-                memcpy(regs_.xmm[vex_vvvv & 15], data, 16);
+                memcpy(regs_.xmm[vex_vvvv & 15], out, 16);
                 break;
             }
 
@@ -3489,25 +3885,10 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 break;
             }
 
-            default: {
-                static int vex_unk_count = 0;
-                if (vex_unk_count < 20)
-                    fprintf(stderr, "[x86] Unimpl VEX 0F opcode: pp=%d 0x%02X at RIP=0x%llX\n",
-                            vex_pp, vex_opcode, (unsigned long long)(regs_.rip - 1));
-                vex_unk_count++;
-                // Skip modrm/sib/disp/imm bytes so RIP lands on next instruction
-                if (vex_opcode < 0xC0) {
-                    uint8_t modrm = read_modrm();
-                    uint64_t rm_addr; bool rm_is_reg;
-                    decode_rm(modrm, &rm_addr, &rm_is_reg);
-                }
-                // Check if instruction has an immediate byte (common for VEX 0F)
-                if (vex_opcode == 0x70 || vex_opcode == 0x71 || vex_opcode == 0x72 ||
-                    vex_opcode == 0x73 || vex_opcode == 0xC2 || vex_opcode == 0xC4 ||
-                    vex_opcode == 0xC5 || vex_opcode == 0xC6)
-                    regs_.rip++; // skip imm8
-                return X86Exception::None; // skip gracefully
-            }
+            default:
+                fprintf(stderr, "[x86] Unimplemented %s 0F opcode: pp=%d 0x%02X at RIP=0x%llX\n",
+                        legacy_simd ? "SSE" : "VEX", vex_pp, vex_opcode, (unsigned long long)(regs_.rip - 1));
+                return X86Exception::InvalidOpcode;
             }
         } else if (vex_mmmmm == 2) {
             // 0F 38 opcode map
@@ -3699,19 +4080,71 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 break;
             }
 
-            default: {
-                static int vex38_unk = 0;
-                if (vex38_unk < 10)
-                    fprintf(stderr, "[x86] Unimpl VEX 0F38 opcode: 0x%02X at RIP=0x%llX\n",
-                            vex_opcode, (unsigned long long)(regs_.rip - 1));
-                vex38_unk++;
-                if (vex_opcode < 0xC0) {
-                    uint8_t modrm = read_modrm();
-                    uint64_t rm_addr; bool rm_is_reg;
-                    decode_rm(modrm, &rm_addr, &rm_is_reg);
+            // BMI1/BMI2 general-purpose register forms
+            case 0xF2: case 0xF3: case 0xF5: case 0xF6: case 0xF7: {
+                uint8_t modrm = read_modrm();
+                int reg = reg_field(modrm);
+                uint64_t rm_addr; bool rm_is_reg;
+                decode_rm(modrm, &rm_addr, &rm_is_reg);
+                const int bits = vex_W ? 64 : 32;
+                const uint64_t mask = vex_W ? ~0ULL : 0xFFFFFFFFULL;
+                uint64_t src = rm_is_reg ? RegByIndex((int)rm_addr) : (vex_W ? ReadMemory64(rm_addr) : ReadMemory32(rm_addr));
+                src &= mask;
+                uint64_t v = RegByIndex(vex_vvvv) & mask;
+                auto put = [&](int idx, uint64_t val) { RegByIndex(idx) = val & mask; };
+                if (vex_opcode == 0xF7) {
+                    unsigned cnt = (unsigned)(v & (bits - 1));
+                    if (vex_pp == 1) put(reg, src << cnt);                                     // SHLX
+                    else if (vex_pp == 3) put(reg, src >> cnt);                                // SHRX
+                    else if (vex_pp == 2) put(reg, vex_W ? (uint64_t)((int64_t)src >> cnt)    // SARX
+                                                         : (uint64_t)(uint32_t)((int32_t)src >> cnt));
+                    else {                                                                     // BEXTR
+                        unsigned start = v & 0xFF, len = (v >> 8) & 0xFF;
+                        uint64_t r = start >= (unsigned)bits ? 0 : src >> start;
+                        if (len < (unsigned)bits) r &= (1ULL << len) - 1;
+                        put(reg, r);
+                        SetZF((r & mask) == 0); SetCF(false); SetOF(false);
+                    }
+                } else if (vex_opcode == 0xF2 && vex_pp == 0) {                               // ANDN
+                    uint64_t r = ~v & src & mask;
+                    put(reg, r);
+                    UpdateFlags(r, bits); SetCF(false); SetOF(false);
+                } else if (vex_opcode == 0xF3 && vex_pp == 0) {                               // BLSR/BLSMSK/BLSI
+                    int op = (modrm >> 3) & 7;
+                    uint64_t r = op == 1 ? (src & (src - 1)) : op == 2 ? (src ^ (src - 1)) : (src & (0 - src));
+                    put(vex_vvvv, r);
+                    UpdateFlags(r & mask, bits); SetCF(op == 3 ? src != 0 : src == 0); SetOF(false);
+                } else if (vex_opcode == 0xF5 && vex_pp == 0) {                               // BZHI
+                    unsigned n = v & 0xFF;
+                    uint64_t r = n < (unsigned)bits ? src & ((1ULL << n) - 1) : src;
+                    put(reg, r);
+                    UpdateFlags(r, bits); SetCF(n > (unsigned)bits - 1); SetOF(false);
+                } else if (vex_opcode == 0xF5) {                                              // PDEP (F2) / PEXT (F3)
+                    uint64_t r = 0;
+                    if (vex_pp == 3) { for (uint64_t m = src, k = 1; m; m &= m - 1, k <<= 1) if (v & k) r |= m & (0 - m); }
+                    else { uint64_t k = 1; for (uint64_t m = src; m; m &= m - 1, k <<= 1) if (v & m & (0 - m)) r |= k; }
+                    put(reg, r);
+                } else if (vex_opcode == 0xF6 && vex_pp == 3) {                               // MULX
+                    uint64_t d = regs_.rdx & mask;
+                    if (vex_W) {
+                        unsigned __int128 p = (unsigned __int128)d * src;
+                        put(vex_vvvv, (uint64_t)p);
+                        put(reg, (uint64_t)(p >> 64));
+                    } else {
+                        uint64_t p = d * src;
+                        put(vex_vvvv, p & 0xFFFFFFFFULL);
+                        put(reg, p >> 32);
+                    }
+                } else {
+                    return X86Exception::InvalidOpcode;
                 }
-                return X86Exception::None; // skip gracefully
+                break;
             }
+
+            default:
+                fprintf(stderr, "[x86] Unimplemented %s 0F38 opcode: pp=%d 0x%02X at RIP=0x%llX\n",
+                        legacy_simd ? "SSE" : "VEX", vex_pp, vex_opcode, (unsigned long long)(regs_.rip - 1));
+                return X86Exception::InvalidOpcode;
             }
         } else if (vex_mmmmm == 3) {
             // 0F 3A opcode map
@@ -4034,25 +4467,59 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 break;
             }
 
-            default: {
-                static int vex3a_unk = 0;
-                if (vex3a_unk < 10)
-                    fprintf(stderr, "[x86] Unimpl VEX 0F3A opcode: 0x%02X at RIP=0x%llX\n",
-                            vex_opcode, (unsigned long long)(regs_.rip - 1));
-                vex3a_unk++;
-                // All 0F3A opcodes have modrm + imm8
-                {
-                    uint8_t modrm = read_modrm();
-                    uint64_t rm_addr; bool rm_is_reg;
-                    decode_rm(modrm, &rm_addr, &rm_is_reg);
-                    read_imm8();
+            // RORX (F2 prefix)
+            case 0xF0: {
+                uint8_t modrm = read_modrm();
+                int reg = reg_field(modrm);
+                uint64_t rm_addr; bool rm_is_reg;
+                decode_rm(modrm, &rm_addr, &rm_is_reg);
+                uint8_t imm = read_imm8();
+                if (vex_W) {
+                    uint64_t src = rm_is_reg ? RegByIndex((int)rm_addr) : ReadMemory64(rm_addr);
+                    unsigned c = imm & 63;
+                    RegByIndex(reg) = c ? (src >> c) | (src << (64 - c)) : src;
+                } else {
+                    uint32_t src = rm_is_reg ? (uint32_t)RegByIndex((int)rm_addr) : ReadMemory32(rm_addr);
+                    unsigned c = imm & 31;
+                    RegByIndex(reg) = c ? (uint32_t)((src >> c) | (src << (32 - c))) : src;
                 }
-                return X86Exception::None; // skip gracefully
+                break;
             }
+
+            default:
+                fprintf(stderr, "[x86] Unimplemented %s 0F3A opcode: pp=%d 0x%02X at RIP=0x%llX\n",
+                        legacy_simd ? "SSE" : "VEX", vex_pp, vex_opcode, (unsigned long long)(regs_.rip - 1));
+                return X86Exception::InvalidOpcode;
             }
         } else {
             fprintf(stderr, "[x86] Unknown VEX map: %d at RIP=0x%llX\n",
                     vex_mmmmm, (unsigned long long)(regs_.rip - 1));
+            return X86Exception::InvalidOpcode;
+        }
+        }  // lanes
+
+        if (lanes == 2) {
+            if (count_operand && op_rm_is_reg && op_rm != op_reg) memcpy(regs_.xmm[op_rm], count_hi, 16);
+            swap_lanes();
+            lane_mem_offset = 0;
+        } else if (!legacy_simd) {
+            // VEX.128 (and scalar) writes zero bits 255:128 of the destination register.
+            int dest = op_reg;
+            if (vex_mmmmm == 1) {
+                switch (vex_opcode) {
+                    case 0x11: case 0x29: case 0x7F: case 0xD6: dest = op_rm_is_reg ? op_rm : -1; break;
+                    case 0x13: case 0x17: case 0x2B: case 0xE7: case 0x2E: case 0x2F: case 0x50:
+                    case 0xD7: case 0xC5: case 0x2C: case 0x2D: dest = -1; break;
+                    case 0x7E: dest = vex_pp == 2 ? op_reg : -1; break;
+                    case 0x71: case 0x72: case 0x73: dest = vex_vvvv; break;
+                    default: break;
+                }
+            } else if (vex_mmmmm == 2) {
+                if (vex_opcode >= 0xF0) dest = -1;
+            } else if ((vex_opcode >= 0x14 && vex_opcode <= 0x17) || vex_opcode == 0xF0) {
+                dest = -1;
+            }
+            if (dest >= 0) memset(regs_.ymm_hi[dest & 15], 0, 16);
         }
         (void)vec_len;
         break;

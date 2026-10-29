@@ -17,11 +17,14 @@ struct X86Regs {
     uint64_t rip;
     uint64_t rflags;
 
-    // SSE registers (simplified)
+    // SSE registers; ymm_hi holds bits 255:128 of the AVX registers.
     __attribute__((aligned(16))) uint8_t xmm[16][16];
+    __attribute__((aligned(16))) uint8_t ymm_hi[16][16];
 
     // Segment registers (unused in flat model but kept for compatibility)
     uint16_t cs, ds, es, fs, gs, ss;
+    // FS holds the thread pointer (TLS); the selectors above are ignored.
+    uint64_t fs_base, gs_base;
 
     // x87 FPU state (simplified)
     double st[8];

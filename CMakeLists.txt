@@ -25,6 +25,7 @@ set(WEB_SRC
   ${KYTY_WEB_SRC}/audio_web.cpp
   ${KYTY_WEB_SRC}/input_web.cpp
   ${KYTY_WEB_SRC}/x86_interpreter.cpp
+  ${KYTY_WEB_SRC}/hle.cpp
 )
 
 add_executable(kytyps5 ${WEB_SRC})
