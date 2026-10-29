@@ -1,14 +1,16 @@
 // GPU stand-in for submitted AGC command buffers, plus the AGC driver and sceVideoOut entry points.
-// Packets the game synchronizes on are executed: memory writes, copies, fills, waits on memory, end-of-pipe
-// label writes and interrupts, and flips. Draws and dispatches are skipped, so nothing is rendered yet.
+// Packets execute in order per queue: register state, memory writes, copies, fills, waits on memory, end-of-pipe
+// label writes and interrupts, flips, and draws and dispatches (rendered in software by raster.cpp).
 // Packet and struct layouts follow KytyPS5 (https://github.com/KytyPS5/KytyPS5, GPL-2.0).
 
 #include "hle.h"
+#include "raster.h"
 #include "web_platform.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -67,27 +69,33 @@ struct VideoOutState {
     int32_t current_buffer = -1;
 } g_vo;
 
-void Flip(int index, int64_t arg) {
+void Flip(int index, int64_t arg, const char* source) {
     g_vo.flip_count++;
+    RasterFrameDone(g_vo.flip_count);
+    if (g_vo.flip_count <= 60)
+        printf("[gpu] flip %llu from %s: buffer %d (0x%llx)\n", (unsigned long long)g_vo.flip_count, source, index,
+               (unsigned long long)(index >= 0 && index < 16 ? g_vo.buffers[index] : 0));
     g_vo.flip_arg = arg;
     g_vo.current_buffer = index;
     g_vo.flip_time_us = NowUs();
     if (g_vo.flip_count == 1 || g_vo.flip_count % 600 == 0)
         printf("[gpu] flip #%llu (buffer %d, %ux%u)\n", (unsigned long long)g_vo.flip_count, index, g_vo.width,
                g_vo.height);
-    // Display buffers are shown as-is: nothing has drawn into them yet, and tiling is not undone.
-    constexpr uint32_t kOutW = 1920, kOutH = 1080;  // the canvas texture size
-    const uint8_t* p = index >= 0 && index < 16 && g_vo.buffers[index]
-                           ? Ptr(g_vo.buffers[index], (uint64_t)g_vo.width * g_vo.height * 4) : nullptr;
-    if (p && g_vo.width == kOutW && g_vo.height == kOutH) {
-        PresentFrame(p, kOutW, kOutH);
-    } else if (p) {
-        static std::vector<uint8_t> scaled(kOutW * kOutH * 4);
-        for (uint32_t y = 0; y < kOutH; y++)
-            for (uint32_t x = 0; x < kOutW; x++)
-                memcpy(&scaled[(y * kOutW + x) * 4],
-                       p + ((uint64_t)(y * g_vo.height / kOutH) * g_vo.width + x * g_vo.width / kOutW) * 4, 4);
-        PresentFrame(scaled.data(), kOutW, kOutH);
+    // The display buffer is detiled and converted to RGBA, then scaled to the canvas texture size.
+    constexpr uint32_t kOutW = 1920, kOutH = 1080;
+    static std::vector<uint8_t> rgba, scaled(kOutW * kOutH * 4);
+    rgba.resize((size_t)g_vo.width * g_vo.height * 4);
+    if (index >= 0 && index < 16 && g_vo.buffers[index] &&
+        RasterReadDisplay(g_vo.buffers[index], g_vo.width, g_vo.height, rgba.data())) {
+        if (g_vo.width == kOutW && g_vo.height == kOutH) {
+            PresentFrame(rgba.data(), kOutW, kOutH);
+        } else {
+            for (uint32_t y = 0; y < kOutH; y++)
+                for (uint32_t x = 0; x < kOutW; x++)
+                    memcpy(&scaled[(y * kOutW + x) * 4],
+                           &rgba[((uint64_t)(y * g_vo.height / kOutH) * g_vo.width + x * g_vo.width / kOutW) * 4], 4);
+            PresentFrame(scaled.data(), kOutW, kOutH);
+        }
     }
     const uint64_t data = (NowUs() & 0xfff) | (std::min<uint64_t>(g_vo.flip_count, 0xf) << 12) |
                           (((uint64_t)arg & 0xffffffffffffULL) << 16);
@@ -115,7 +123,7 @@ void VideoOutRegisterBuffers2(X86Regs& r) {  // (handle, set, start, buffers*, n
 }
 void VideoOutSubmitFlip(X86Regs& r) {  // (handle, index, mode, arg)
     g_vo.submit_time_us = NowUs();
-    Flip((int)r.rsi, (int64_t)r.rcx);
+    Flip((int)r.rsi, (int64_t)r.rcx, "sceVideoOutSubmitFlip");
     r.rax = 0;
 }
 void VideoOutAddFlipEvent(X86Regs& r) {  // (eq, handle, udata)
@@ -158,8 +166,14 @@ void VideoOutSetBufferAttribute2(X86Regs& r) {  // (attr*, pixel_format, tiling,
     memcpy(a + 0x30, &dcc_control, 4);
     if (auto* p = Ptr(r.rdi, sizeof(a))) memcpy(p, a, sizeof(a));
 }
-void VideoOutGetOutputStatus(X86Regs& r) {
-    if (auto* p = Ptr(r.rsi, 0x30)) memset(p, 0, 0x30);
+void VideoOutGetOutputStatus(X86Regs& r) {  // (handle, status*): resolution, dynamic range, refresh rate, flags
+    uint8_t s[0x30] = {};
+    const uint32_t resolution = 1, dynamic_range = 1;  // the 1080p output, SDR
+    const uint64_t refresh_rate = 3;                   // 59.94 Hz
+    memcpy(s + 0x00, &resolution, 4);
+    memcpy(s + 0x04, &dynamic_range, 4);
+    memcpy(s + 0x08, &refresh_rate, 8);
+    if (auto* p = Ptr(r.rsi, sizeof(s))) memcpy(p, s, sizeof(s));
     r.rax = 0;
 }
 void RetZero(X86Regs& r) { r.rax = 0; }
@@ -219,6 +233,94 @@ void DmaData(const uint32_t* b) {
     }
 }
 
+// --- GPU register state ---
+// Context (0xA000+), SH (0x2C00+) and user-config (0xC000+) registers as the command buffers set them,
+// directly or through PS5 "indirect" packets that point at (offset, value) pairs in memory.
+uint32_t g_cx[0x400], g_sh[0x300], g_uc[0x4000];
+// Draw state outside the registers.
+uint64_t g_index_base = 0;
+uint32_t g_index_type = 0, g_instances = 1;
+constexpr uint32_t kRegSelector = 0x70000000u;  // high bits of indirect offsets select the register bank
+void SetCx(uint32_t off, uint32_t v) { off &= ~kRegSelector; if (off < 0x400) g_cx[off] = v; }
+void SetSh(uint32_t off, uint32_t v) { off &= ~kRegSelector; if (off < 0x300) g_sh[off] = v; }
+void SetUc(uint32_t off, uint32_t v) {
+    off &= ~kRegSelector;
+    if (off < 0x4000) g_uc[off] = v;
+    if (off == 0x243) g_index_type = v & 3;  // VGT_INDEX_TYPE
+}
+void SetIndirect(const uint32_t* b, void (*set)(uint32_t, uint32_t)) {
+    const uint64_t pairs = (b[0] & ~3u) | ((uint64_t)b[1] << 32);
+    const uint32_t n = b[3] & 0x3fff;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t off = Rd<uint32_t>(pairs + 8ull * i), v = Rd<uint32_t>(pairs + 8ull * i + 4);
+        if (off != 0xffffffffu) set(off, v);
+    }
+}
+uint64_t ShaderAddress(uint32_t lo_reg) { return ((uint64_t)g_sh[lo_reg] << 8) | ((uint64_t)(g_sh[lo_reg + 1] & 0xff) << 40); }
+
+uint32_t IndexType() { return g_index_type; }
+
+// CLEAR_STATE restores the context registers' power-on values; the ones draws depend on aren't zero.
+void ResetContext() {
+    memset(g_cx, 0, sizeof(g_cx));
+    const float one = 1.0f;
+    uint32_t one_bits;
+    memcpy(&one_bits, &one, 4);
+    g_cx[0x202] = 0x00CC0010;  // CB_COLOR_CONTROL: normal mode, ROP3 copy
+    for (uint32_t r : {0x10Fu, 0x111u, 0x113u}) g_cx[r] = one_bits;  // viewport scales
+    g_cx[0x206] = 0x43F;  // PA_CL_VTE_CNTL: viewport transform enabled
+    for (uint32_t r : {0x0Du, 0x82u, 0x91u, 0x95u}) g_cx[r] = 0x40004000;  // scissor bottom-right corners
+    for (uint32_t i = 0; i < 8; i++) g_cx[0x1E0 + i] = 0x20010001;  // CB_BLEND_CONTROL: ONE, ONE (disabled)
+}
+void Draw(uint32_t count, uint64_t index_addr) {
+    DrawCall d;
+    d.count = count;
+    d.index_addr = index_addr;
+    d.index_type = IndexType();
+    d.instances = g_instances;
+    RasterDraw(GpuRegs{g_cx, g_sh, g_uc}, d);
+}
+
+// With KYTY_DUMP=<dir> (native runs), the first draws are described in the log and their shaders written to
+// <dir>/shader_<address>.bin, for disassembly with llvm-mc -arch=amdgcn -mcpu=gfx1013.
+int g_draws_described = 0;
+void DumpShader(uint64_t addr) {
+    static std::unordered_map<uint64_t, bool> dumped;
+    const char* dir = getenv("KYTY_DUMP");
+    if (!dir || !addr || dumped[addr]) return;
+    dumped[addr] = true;
+    uint32_t n = 0;  // up to and including s_endpgm
+    while (n < 16384 && Rd<uint32_t>(addr + 4ull * n) != 0xBF810000u) n++;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/shader_%llx.bin", dir, (unsigned long long)addr);
+    if (FILE* f = fopen(path, "wb")) {
+        if (const uint8_t* p = Ptr(addr, 4ull * (n + 1))) fwrite(p, 4, n + 1, f);
+        fclose(f);
+    }
+}
+void DescribeDraw(const char* what, uint32_t count) {
+    if (!getenv("KYTY_DUMP")) return;
+    DumpShader(ShaderAddress(0x8));
+    DumpShader(ShaderAddress(0xC8));
+    DumpShader(ShaderAddress(0x20C));
+    if (g_draws_described >= 200) return;
+    g_draws_described++;
+    const uint64_t gs = ShaderAddress(0x88), ps = ShaderAddress(0x8), es = ShaderAddress(0xC8), hs = ShaderAddress(0x108);
+    printf("[gpu] %s count %u prim %u | GS 0x%llx PS 0x%llx ES 0x%llx HS 0x%llx | stages 0x%x | CB0 base 0x%llx view 0x%x info 0x%x attrib 0x%x | target mask 0x%x col fmt 0x%x\n",
+           what, count, g_uc[0x242] & 0x3f, (unsigned long long)gs, (unsigned long long)ps, (unsigned long long)es,
+           (unsigned long long)hs, g_cx[0x2D5], (unsigned long long)g_cx[0x318] << 8, g_cx[0x31B], g_cx[0x31C],
+           g_cx[0x31D], g_cx[0x8E], g_cx[0x1C5]);
+    printf("[gpu]   GS user data:");
+    for (int i = 0; i < 16; i++) printf(" %08x", g_sh[0x8C + i]);
+    printf("\n[gpu]   PS user data:");
+    for (int i = 0; i < 16; i++) printf(" %08x", g_sh[0xC + i]);
+    printf("\n");
+    DumpShader(gs);
+    DumpShader(ps);
+    DumpShader(es);
+    DumpShader(hs);
+}
+
 // Each queue runs its submissions in order. A WAIT_REG_MEM on memory whose condition doesn't hold yet stops the
 // queue (as the hardware would stall) until GpuPoll() sees the value change, typically a label the CPU writes.
 struct Stream { uint64_t addr; uint32_t pos, dw_num; };
@@ -262,10 +364,13 @@ bool Run(Submission& sub, int event_id, Queue& q) {
         if (!b) { sub.stack.pop_back(); continue; }
         const uint32_t op = (hdr >> 8) & 0xff;
         if (g_trace_budget > 0) g_trace_ops += " " + std::to_string(op);
+        if (RasterDebugFrame())
+            printf("[gpu] queue %d @0x%llx op 0x%02x len %u: %08x %08x %08x %08x\n", event_id, (unsigned long long)at, op, len,
+                   len > 1 ? b[0] : 0, len > 2 ? b[1] : 0, len > 3 ? b[2] : 0, len > 4 ? b[3] : 0);
         constexpr uint32_t kFlipMarker = 0x17;
         switch (op) {
             case 0x10:  // NOP; AgcDcbSetFlip marks its flip in the header's register field
-                if (((hdr >> 2) & 0x3f) == kFlipMarker && len >= 6) Flip((int32_t)b[1], (int64_t)(b[3] | ((uint64_t)b[4] << 32)));
+                if (((hdr >> 2) & 0x3f) == kFlipMarker && len >= 6) Flip((int32_t)b[1], (int64_t)(b[3] | ((uint64_t)b[4] << 32)), "command buffer");
                 break;
             case 0x37: {  // WRITE_DATA
                 const uint64_t dst = b[1] | ((uint64_t)b[2] << 32);
@@ -288,6 +393,36 @@ bool Run(Submission& sub, int event_id, Queue& q) {
             case 0x40: CopyData(b); break;
             case 0x50: DmaData(b); break;
             case 0x49: ReleaseMem(b, event_id); break;
+            case 0x12: ResetContext(); break;  // CLEAR_STATE
+            case 0x69: for (uint32_t i = 1; i + 1 < len; i++) SetCx(b[0] + i - 1, b[i]); break;  // SET_CONTEXT_REG
+            case 0x76: for (uint32_t i = 1; i + 1 < len; i++) SetSh(b[0] + i - 1, b[i]); break;  // SET_SH_REG
+            case 0x79: case 0x7A: for (uint32_t i = 1; i + 1 < len; i++) SetUc((b[0] & 0xffff) + i - 1, b[i]); break;
+            case 0x9F: if (len == 5) SetIndirect(b, SetCx); break;  // SET_CONTEXT_REG_INDIRECT
+            case 0x63: if (len == 5) SetIndirect(b, SetSh); break;  // SET_SH_REG_INDIRECT
+            case 0x64: if (len == 5) SetIndirect(b, SetUc); break;  // SET_UCONFIG_REG_INDIRECT
+            case 0x2D: DescribeDraw("DRAW_INDEX_AUTO", b[0]); Draw(b[0], 0); break;
+            case 0x27:  // DRAW_INDEX_2: max size, address, count
+                DescribeDraw("DRAW_INDEX_2", b[3]);
+                Draw(b[3], b[1] | ((uint64_t)(b[2] & 0xffff) << 32));
+                break;
+            case 0x3A:  // DRAW_INDEX with instances: count, address, ..., instances
+                if (len >= 8) {
+                    const uint32_t saved = g_instances;
+                    g_instances = b[6];
+                    Draw(b[0], b[1] | ((uint64_t)(b[2] & 0xffff) << 32));
+                    g_instances = saved;
+                }
+                break;
+            case 0x35:  // DRAW_INDEX_OFFSET_2: max size, offset, count
+                Draw(b[2], g_index_base + (uint64_t)b[1] * (IndexType() == 1 ? 4 : IndexType() == 2 ? 1 : 2));
+                break;
+            case 0x15:  // DISPATCH_DIRECT: x, y, z, initiator
+                DescribeDraw("DISPATCH_DIRECT", b[0] * b[1] * b[2]);
+                RasterDispatch(GpuRegs{g_cx, g_sh, g_uc}, b[0], b[1], b[2], b[3]);
+                break;
+            case 0x26: g_index_base = b[0] | ((uint64_t)(b[1] & 0xffff) << 32); break;  // INDEX_BASE
+            case 0x2A: g_index_type = b[0] & 3; break;                                  // INDEX_TYPE
+            case 0x2F: g_instances = std::max(b[0], 1u); break;                         // NUM_INSTANCES
             case 0x3F: {  // INDIRECT_BUFFER
                 const Stream ib{(b[0] & ~3u) | ((uint64_t)(b[1] & 0xffff) << 32), 0, b[2] & 0xfffff};
                 st.pos += len;
@@ -408,12 +543,18 @@ const Entry* Lookup(const std::string& nid) {
 
 } // namespace
 
-void GpuSetup(const HleLayout& layout) { L = layout; }
+void GpuSetup(const HleLayout& layout) {
+    L = layout;
+    ResetContext();
+    RasterSetup(layout);
+}
 
 void GpuPoll() {
     for (auto& [event_id, q] : g_queues)
         if (!q.pending.empty()) Drain(event_id, q);
 }
+
+uint64_t GpuFlipCount() { return g_vo.flip_count; }
 
 HleFn GpuFind(const std::string& nid) {
     const Entry* e = Lookup(nid);

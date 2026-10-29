@@ -31,6 +31,9 @@ set(WEB_SRC
   ${KYTY_WEB_SRC}/gpu.cpp
   ${KYTY_WEB_SRC}/ampr.cpp
   ${KYTY_WEB_SRC}/unwind.cpp
+  ${KYTY_WEB_SRC}/rdna.cpp
+  ${KYTY_WEB_SRC}/raster.cpp
+  ${KYTY_WEB_SRC}/avplayer.cpp
 )
 
 add_executable(kytyps5 ${WEB_SRC})
@@ -53,7 +56,8 @@ endif()
 # Link flags
 set(LINK_FLAGS
   "-sUSE_PTHREADS=1"
-  "-sPTHREAD_POOL_SIZE=4"
+  # Pixel shading runs on up to 8 threads (raster.cpp); their workers are started with the page.
+  "-sPTHREAD_POOL_SIZE=8"
   "-sALLOW_MEMORY_GROWTH=1"
   "-sINITIAL_MEMORY=268435456"
   "-sMAXIMUM_MEMORY=4294967296"
