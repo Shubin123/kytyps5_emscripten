@@ -64,8 +64,6 @@ def sample_forms(paths):
                 if any(b in (0x64, 0x65) for b in raw[:4]): continue  # fs:/gs: segment overrides
                 if 0x67 in raw[:4]: continue                            # 32-bit addressing
                 mems = [o for o in ins.operands if o.type == X86_OP_MEM]
-                if any(o.mem.index != X86_REG_INVALID and md.reg_name(o.mem.index)[:3] in ('xmm', 'ymm') for o in mems):
-                    continue  # gathers
                 if any(o.mem.base == X86_REG_INVALID and o.mem.index == X86_REG_INVALID for o in mems): continue
                 key = form_key(md, ins)
                 # Encodings of a form differ in prefixes, REX/VEX register bits, ModRM and SIB: keep up to
@@ -105,9 +103,15 @@ def make_cases(md, ins, rng):
         regs['rsp'] = DATA_MID - 0x40000 - 8 * rng.randrange(0, 16)
         if ins.mnemonic.startswith(('rep', 'movs', 'stos', 'lods', 'cmps', 'scas')) or 'movs' in ins.mnemonic and ins.mnemonic in ('movsb', 'movsw', 'movsd', 'movsq'):
             regs['rsi'], regs['rdi'], regs['rcx'] = DATA_MID, DATA_MID + 0x4000, rng.randrange(0, 24)
+        vector_index = None  # gathers: (register number, index size) of the VSIB index vector
         for o in mems:
             if o.mem.base == X86_REG_RIP: continue
             base = full(md, o.mem.base) if o.mem.base != X86_REG_INVALID else None
+            vname = md.reg_name(o.mem.index) if o.mem.index != X86_REG_INVALID else ''
+            if vname[:3] in ('xmm', 'ymm'):
+                vector_index = (int(vname[3:]), 8 if 'gatherq' in ins.mnemonic else 4)
+                regs[base] = (DATA_MID + 16 * rng.randrange(-64, 64) - o.mem.disp) & 0xffffffffffffffff
+                continue
             index = full(md, o.mem.index) if o.mem.index != X86_REG_INVALID else None
             scale, disp = o.mem.scale, o.mem.disp
             target = DATA_MID + 16 * rng.randrange(-64, 64)
@@ -117,6 +121,10 @@ def make_cases(md, ins, rng):
             elif index: regs[index] = ((target - disp) // scale) & 0xffffffffffffffff
         flags = 0x202 | (rng.getrandbits(12) & 0x8d5)
         ymm = b''.join(float_lanes(rng, kind % 3) for _ in range(16))
+        if vector_index:  # small indices, so every element lands in the scratch area
+            r, size = vector_index
+            lanes = b''.join(struct.pack('<q' if size == 8 else '<i', rng.randrange(-32, 32)) for _ in range(32 // size))
+            ymm = ymm[:32 * r] + lanes + ymm[32 * (r + 1):]
         rec = struct.pack('<B', len(raw)) + bytes(raw).ljust(15, b'\x90')
         rec += b''.join(struct.pack('<Q', regs[r] & 0xffffffffffffffff) for r in ORDER)
         rec += struct.pack('<Q', flags) + ymm + struct.pack('<Q', rng.getrandbits(64))

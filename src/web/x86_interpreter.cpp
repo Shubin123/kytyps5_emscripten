@@ -2774,6 +2774,42 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                     else mem_in(a + i, data + i, esz);
                 }
                 if (!store) ymm_set(reg_field(modrm), data, vex_L);
+            } else if (vex_mmmmm == 2 && vex_pp == 1 && op >= 0x90 && op <= 0x93) {
+                // VPGATHERDD/DQ/QD/QQ, VGATHERDPS/DPD/QPS/QPD. VSIB addressing: base + displacement plus each
+                // element of a vector of dword (0x90, 0x92) or qword (0x91, 0x93) indices, scaled. Elements
+                // whose mask (vvvv) sign bit is set are loaded, the others keep their value; the mask is cleared.
+                const uint8_t modrm = read_modrm();
+                const int mod = (modrm >> 6) & 3;
+                if (mod == 3 || (modrm & 7) != 4) return X86Exception::InvalidOpcode;
+                const uint8_t sib = ReadMemory8(regs_.rip++);
+                const int scale = (sib >> 6) & 3, vindex = ((sib >> 3) & 7) | (rex_x << 3);
+                uint64_t base;
+                if ((sib & 7) == 5 && mod == 0) {
+                    base = (uint64_t)(int64_t)(int32_t)ReadMemory32(regs_.rip);
+                    regs_.rip += 4;
+                } else {
+                    base = RegByIndex((sib & 7) | (rex_b << 3));
+                }
+                if (mod == 1) { base += (uint64_t)(int64_t)(int8_t)ReadMemory8(regs_.rip); regs_.rip += 1; }
+                if (mod == 2) { base += (uint64_t)(int64_t)(int32_t)ReadMemory32(regs_.rip); regs_.rip += 4; }
+                base += seg_base + lane_mem_offset;
+                const int esz = vex_W ? 8 : 4, isz = (op & 1) ? 8 : 4;
+                const int count = width / std::max(esz, isz);
+                uint8_t index[32], mask[32], data[32] = {};
+                ymm_get(vindex, index);
+                ymm_get(vex_vvvv, mask);
+                ymm_get(reg_field(modrm), data);
+                for (int i = 0; i < count; i++) {
+                    if (!(mask[i * esz + esz - 1] & 0x80)) continue;
+                    int64_t ix;
+                    if (isz == 8) { memcpy(&ix, index + 8 * i, 8); }
+                    else { int32_t v; memcpy(&v, index + 4 * i, 4); ix = v; }
+                    mem_in(base + ((uint64_t)ix << scale), data + i * esz, esz);
+                }
+                memset(data + count * esz, 0, sizeof(data) - count * esz);  // beyond the elements: zeroed
+                memset(mask, 0, sizeof(mask));
+                ymm_set(reg_field(modrm), data, true);
+                ymm_set(vex_vvvv, mask, true);
             } else if (vex_mmmmm == 2 && (op == 0x0E || op == 0x0F || op == 0x17)) {
                 // VTESTPS/VTESTPD test sign bits; VPTEST tests every bit
                 uint8_t modrm = read_modrm(); uint64_t a; bool is_reg; decode_rm(modrm, &a, &is_reg);
