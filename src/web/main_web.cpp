@@ -1087,6 +1087,8 @@ void kyty_input_values(int buttons, float lx, float ly, float rx, float ry, floa
 
 int kyty_get_screen_width() { return g_screen_w; }
 int kyty_get_screen_height() { return g_screen_h; }
+// Frames the game has presented, for input scripted by frame (the frontend's ?press=).
+double kyty_flip_count() { return (double)KytyWeb::GpuFlipCount(); }
 
 #ifdef __EMSCRIPTEN__
 int main(int argc, char** argv) {

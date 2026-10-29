@@ -4,11 +4,12 @@ Experimental WebAssembly / Emscripten port of a PlayStation 5 emulator: an x86-6
 high-level implementations of the PS5 SDK, running in the browser. The frontend lives in
 [kytyps5_web](https://github.com/Shubin123/kytyps5_web).
 
-**Status:** River City Girls (PPSA04075, Unity/IL2CPP) boots through Unity's engine and IL2CPP runtime
-start-up, runs its job, loading, graphics and FMOD audio threads, and starts loading its first scene. The GPU
-is a stand-in that executes the packets games synchronize on (memory writes, waits, end-of-pipe interrupts,
-flips) but draws nothing, so the screen stays black. The interpreter runs roughly 7 million guest
-instructions per second, far fewer than the game needs to reach its title screen in reasonable time.
+**Status:** River City Girls (PPSA04075, Unity/IL2CPP) plays from boot into its first stage: intro movies,
+title screen, file, mode and character select, the loading screen and the detention-room fight, all driven by
+the controller. Frames are drawn by a software GPU: the game's RDNA shaders run in an interpreter and a
+multi-threaded rasterizer textures and blends them into its render targets. There is no video decoder, so
+movies play for their real length as black frames. It is slow: about a second per frame natively on an Apple
+M4 and two in the browser, and about a quarter of an hour natively from boot to the first stage.
 
 See [WEB_PORT.md](WEB_PORT.md) for architecture details and build instructions.
 
@@ -19,6 +20,9 @@ git clone --depth 1 https://github.com/InoriRus/Kyty.git upstream
 bash tools/web/build.sh
 cd ../kytyps5_web && npm run sync && npm start
 ```
+
+Or run it natively without a browser (`bash tools/native/build.sh`, then `build-native/kytyps5 <game folder>`;
+see [WEB_PORT.md](WEB_PORT.md#native-headless-runner)).
 
 ## License
 
