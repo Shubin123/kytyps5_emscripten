@@ -105,7 +105,7 @@ constexpr uint32_t R_X86_64_RELATIVE  = 8;
 #define ELF64_R_TYPE(i)  ((uint32_t)((i) & 0xffffffff))
 
 constexpr uint64_t EMU_BASE_ADDR = 0x100000;
-constexpr uint64_t EMU_MEM_SIZE  = 512ULL * 1024 * 1024; // 512 MB emulated address space
+constexpr uint64_t EMU_MEM_SIZE  = 1536ULL * 1024 * 1024; // 1.5 GB emulated address space (Unity reserves a lot)
 // Layout: image | malloc heap | kernel mappings | main stack | HLE stubs + process args
 constexpr uint64_t HLE_STUB_BASE  = EMU_BASE_ADDR + EMU_MEM_SIZE - 0x100000;
 constexpr uint64_t PROC_ARGS_ADDR = HLE_STUB_BASE + 0x80000;
@@ -200,6 +200,13 @@ static size_t StubImport(const std::string& nid) {
         else r.rax = 0;
     });
     return idx;
+}
+
+// The SDK function an import stub address belongs to, or "" for other addresses.
+static std::string StubName(uint64_t a) {
+    if (a < HLE_STUB_BASE || (a - HLE_STUB_BASE) / 16 >= g_imports.size()) return {};
+    const Import& imp = g_imports[(a - HLE_STUB_BASE) / 16];
+    return imp.name ? imp.name : imp.nid;
 }
 
 static void BindSymbol(uint64_t slot, const char* symbol, int64_t addend) {
@@ -715,6 +722,7 @@ static void MainLoop() {
                    (unsigned long long)g_cpu->Regs().rip, g_hle_call_count);
         }
         if (diag_frames == 5 || diag_frames % 120 == 0) LogTopImports();
+        if (diag_frames > 0 && diag_frames % 600 == 0) KytyWeb::HleDumpThreads(StubName);
         diag_frames++;
         quiet_frames = g_hle_call_count == calls_before ? quiet_frames + 1 : 0;
         if (quiet_frames == 3) DumpStall();
@@ -767,9 +775,7 @@ static void MainLoop() {
         }
     }
 
-    // Present the framebuffer
-    KytyWeb::PresentFrame(g_framebuffer.data(), g_screen_w, g_screen_h);
-    g_frame_count++;
+    g_frame_count++;  // the canvas is updated on guest flips (gpu.cpp)
 }
 
 } // anonymous namespace
@@ -797,6 +803,7 @@ int kyty_init(const char* config_json) {
     // Create CPU interpreter
     g_cpu = new KytyWeb::X86Interpreter();
     g_cpu->SetMemory(g_emu_memory, EMU_MEM_SIZE, EMU_BASE_ADDR);
+    g_cpu->SetAddressNamer(StubName);
 
     // Register syscall handler
     g_cpu->RegisterSyscallHandler(HLE_syscall);
@@ -928,9 +935,27 @@ int kyty_load_game(const char* game_path) {
     return 0;
 }
 
+// Streamed files. Chunks are 1 MB (kChunkSize in hle.cpp); a request is encoded as
+// file * 1e7 + chunk index so it fits a JS number, or -1 when nothing is waiting.
+int kyty_lazy_register(const char* path, double size) { return KytyWeb::HleLazyRegister(path, (uint64_t)size); }
+
+double kyty_lazy_request() {
+    int file;
+    uint64_t chunk;
+    return KytyWeb::HleLazyNextRequest(&file, &chunk) ? file * 1e7 + (double)chunk : -1.0;
+}
+
+void kyty_lazy_provide(int file, double chunk, const uint8_t* data, double length) {
+    KytyWeb::HleLazyProvide(file, (uint64_t)chunk, data, (uint64_t)length);
+}
+
 // Debug aid: log when execution reaches a runtime address. Call after kyty_init.
 void kyty_watch(uint32_t addr) {
     if (g_cpu) g_cpu->AddWatch(addr);
+}
+
+void kyty_watch_memory(uint32_t addr) {
+    if (g_cpu) g_cpu->AddMemoryWatch(addr);
 }
 
 void kyty_frame() {
@@ -945,6 +970,7 @@ void kyty_input_values(int buttons, float lx, float ly, float rx, float ry, floa
     g_pad_input.ry = ry;
     g_pad_input.l2 = l2;
     g_pad_input.r2 = r2;
+    if (g_cpu) KytyWeb::HleSetPadState((uint32_t)buttons, lx, ly, rx, ry, l2, r2);
 }
 
 int kyty_get_screen_width() { return g_screen_w; }

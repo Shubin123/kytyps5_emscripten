@@ -1,7 +1,8 @@
 // PS5 SDK functions implemented against the emulated address space.
-// Single-threaded: thread creation is recorded but threads never run, and blocking waits return at once.
+// Guest threads run cooperatively on the one interpreter; blocking calls park the calling thread.
 
 #include "hle.h"
+#include "web_platform.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -18,8 +19,11 @@
 #include <ctime>
 #include <deque>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
+#include <set>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -202,14 +206,40 @@ void AddRegion(uint64_t start, uint64_t size, int prot, HleRegion kind, uint64_t
     if (start >= L.vm_start && start + size <= L.vm_end) g_vm_top = std::max(g_vm_top, start + size);
 }
 
+// First fit in the vm range, so space that was unmapped gets reused.
 uint64_t VmAlloc(uint64_t size, uint64_t align, int prot, HleRegion kind, uint64_t phys, int mtype, const char* name) {
     size = (size + 0x3FFF) & ~0x3FFFULL;
     if (align < 0x4000) align = 0x4000;
-    uint64_t a = (g_vm_top + align - 1) / align * align;
-    if (!size || a + size > L.vm_end) {
+    auto fits = [&](uint64_t from, uint64_t to) -> uint64_t {
+        const uint64_t a = (from + align - 1) / align * align;
+        return a >= from && a + size <= to && a + size > a ? a : 0;
+    };
+    uint64_t a = 0, cursor = L.vm_start;
+    for (auto it = g_regions.lower_bound(L.vm_start); size && !a && it != g_regions.end(); ++it) {
+        if (it->second.start >= L.vm_end) break;
+        a = fits(cursor, it->second.start);
+        cursor = std::max(cursor, it->second.end);
+    }
+    if (size && !a) a = fits(cursor, L.vm_end);
+    if (!a) {
+        static bool reported = false;
         printf("[hle] address space exhausted (request 0x%llx, %s)\n", (unsigned long long)size, name ? name : "");
+        if (!reported) {
+            reported = true;
+            std::vector<const Region*> big;
+            for (auto& [start, g] : g_regions)
+                if (start >= L.vm_start && start < L.vm_end) big.push_back(&g);
+            std::sort(big.begin(), big.end(), [](const Region* x, const Region* y) {
+                return x->end - x->start > y->end - y->start;
+            });
+            for (size_t i = 0; i < big.size() && i < 12; i++)
+                printf("[hle]   0x%llx-0x%llx %6llu KB %s\n", (unsigned long long)big[i]->start,
+                       (unsigned long long)big[i]->end, (unsigned long long)((big[i]->end - big[i]->start) >> 10),
+                       big[i]->name);
+        }
         return 0;
     }
+    if (auto* p = Ptr(a, size)) memset(p, 0, size);  // reused space would otherwise keep old contents
     AddRegion(a, size, prot, kind, phys, mtype, name);
     return a;
 }
@@ -735,25 +765,56 @@ void Ftell(X86Regs& r) {
     Ret(r, it != g_files.end() ? ftell(it->second) : -1);
 }
 
-// files (POSIX and sceKernel flavors)
-int64_t OpenImpl(X86Regs& r) {
-    std::string path = HostPath(Str(r.rdi));
-    int fd = open(path.c_str(), HostOpenFlags((uint32_t)r.rsi), 0666);
+// Streamed files (defined after the thread code): big media read on demand from the frontend.
+constexpr int64_t kParked = INT64_MIN;  // the read parked its thread until the data arrives
+int LazyOpen(const std::string& path);
+bool IsLazyFd(int fd);
+int64_t LazyRead(X86Regs& r, int fd, uint64_t buf, uint64_t n, int64_t pos);
+int64_t LazySeek(int fd, int64_t off, int whence);
+bool LazyStatPath(const std::string& path, struct stat* st);
+bool LazyStatFd(int fd, struct stat* st);
+void LazyClose(int fd);
+
+int FileOpen(const std::string& path, int flags) {
+    int fd = LazyOpen(path);
+    if (fd < 0) fd = open(path.c_str(), flags, 0666);
+    else errno = 0;
     LogOpen(path, fd);
     return fd;
 }
+int FileClose(int fd) {
+    if (IsLazyFd(fd)) { LazyClose(fd); return 0; }
+    return close(fd);
+}
+int64_t FileSeek(int fd, int64_t off, int whence) {
+    return IsLazyFd(fd) ? LazySeek(fd, off, whence) : (int64_t)lseek(fd, (off_t)off, whence);
+}
+int FileStatPath(const std::string& path, struct stat* st) { return LazyStatPath(path, st) ? 0 : stat(path.c_str(), st); }
+int FileStatFd(int fd, struct stat* st) {
+    if (IsLazyFd(fd)) return LazyStatFd(fd, st) ? 0 : -1;
+    return fstat(fd, st);
+}
+
+// files (POSIX and sceKernel flavors)
+int64_t OpenImpl(X86Regs& r) { return FileOpen(HostPath(Str(r.rdi)), HostOpenFlags((uint32_t)r.rsi)); }
 void Open(X86Regs& r) { int64_t fd = OpenImpl(r); if (fd < 0) SetErrno(errno); Ret(r, fd); }
 void KernelOpen(X86Regs& r) { int64_t fd = OpenImpl(r); Ret(r, fd < 0 ? SceErr(errno) : fd); }
-void Close(X86Regs& r) { Ret(r, close((int)r.rdi)); }
-void KernelClose(X86Regs& r) { Ret(r, close((int)r.rdi) < 0 ? SceErr(errno) : 0); }
+void Close(X86Regs& r) { Ret(r, FileClose((int)r.rdi)); }
+void KernelClose(X86Regs& r) { Ret(r, FileClose((int)r.rdi) < 0 ? SceErr(errno) : 0); }
 int64_t ReadImpl(X86Regs& r, bool positional) {
+    if (IsLazyFd((int)r.rdi)) return LazyRead(r, (int)r.rdi, r.rsi, r.rdx, positional ? (int64_t)r.rcx : -1);
     auto* p = Ptr(r.rsi, r.rdx);
     if (!p) { errno = EFAULT; return -1; }
     return positional ? pread((int)r.rdi, p, r.rdx, (off_t)r.rcx) : read((int)r.rdi, p, r.rdx);
 }
-void Read(X86Regs& r) { int64_t n = ReadImpl(r, false); if (n < 0) SetErrno(errno); Ret(r, n); }
-void KernelRead(X86Regs& r) { int64_t n = ReadImpl(r, false); Ret(r, n < 0 ? SceErr(errno) : n); }
-void KernelPread(X86Regs& r) { int64_t n = ReadImpl(r, true); Ret(r, n < 0 ? SceErr(errno) : n); }
+void Read(X86Regs& r) {
+    int64_t n = ReadImpl(r, false);
+    if (n == kParked) return;
+    if (n < 0) SetErrno(errno);
+    Ret(r, n);
+}
+void KernelRead(X86Regs& r) { int64_t n = ReadImpl(r, false); if (n != kParked) Ret(r, n < 0 ? SceErr(errno) : n); }
+void KernelPread(X86Regs& r) { int64_t n = ReadImpl(r, true); if (n != kParked) Ret(r, n < 0 ? SceErr(errno) : n); }
 int64_t WriteImpl(X86Regs& r, bool positional) {
     auto* p = Ptr(r.rsi, r.rdx);
     if (!p) { errno = EFAULT; return -1; }
@@ -763,19 +824,19 @@ int64_t WriteImpl(X86Regs& r, bool positional) {
 void KernelWrite(X86Regs& r) { int64_t n = WriteImpl(r, false); Ret(r, n < 0 ? SceErr(errno) : n); }
 void KernelPwrite(X86Regs& r) { int64_t n = WriteImpl(r, true); Ret(r, n < 0 ? SceErr(errno) : n); }
 void KernelLseek(X86Regs& r) {
-    off_t o = lseek((int)r.rdi, (off_t)r.rsi, (int)r.rdx);
-    Ret(r, o < 0 ? SceErr(errno) : (int64_t)o);
+    int64_t o = FileSeek((int)r.rdi, (int64_t)r.rsi, (int)r.rdx);
+    Ret(r, o < 0 ? SceErr(errno) : o);
 }
 void KernelStat(X86Regs& r) {
     std::string path = HostPath(Str(r.rdi));
     struct stat st{};
-    if (stat(path.c_str(), &st) < 0) { LogOpen(path, -1); Ret(r, SceErr(errno)); return; }
+    if (FileStatPath(path, &st) < 0) { LogOpen(path, -1); Ret(r, SceErr(errno)); return; }
     WriteStat(r.rsi, st);
     r.rax = 0;
 }
 void KernelFstat(X86Regs& r) {
     struct stat st{};
-    if (fstat((int)r.rdi, &st) < 0) { Ret(r, SceErr(errno)); return; }
+    if (FileStatFd((int)r.rdi, &st) < 0) { Ret(r, SceErr(errno)); return; }
     WriteStat(r.rsi, st);
     r.rax = 0;
 }
@@ -894,10 +955,6 @@ void Dlsym(X86Regs& r) {
     printf("[hle] dlsym %s: unresolved\n", Str(r.rsi, 256).c_str());
     Ret(r, kSceErrEnoent);
 }
-void VideoOutOpen(X86Regs& r) {
-    printf("[hle] sceVideoOutOpen(user=%d, bus=%d)\n", (int)r.rdi, (int)r.rsi);
-    r.rax = 1;
-}
 
 // C++ runtime
 void PosixMemalign(X86Regs& r) {
@@ -983,18 +1040,18 @@ void Fgetc(X86Regs& r) {
 void PosixStat(X86Regs& r) {
     std::string path = HostPath(Str(r.rdi));
     struct stat st{};
-    if (stat(path.c_str(), &st) < 0) { LogOpen(path, -1); SetErrno(errno); Ret(r, -1); return; }
+    if (FileStatPath(path, &st) < 0) { LogOpen(path, -1); SetErrno(errno); Ret(r, -1); return; }
     WriteStat(r.rsi, st);
     r.rax = 0;
 }
 void PosixFstat(X86Regs& r) {
     struct stat st{};
-    if (fstat((int)r.rdi, &st) < 0) { SetErrno(errno); Ret(r, -1); return; }
+    if (FileStatFd((int)r.rdi, &st) < 0) { SetErrno(errno); Ret(r, -1); return; }
     WriteStat(r.rsi, st);
     r.rax = 0;
 }
 void PosixLseek(X86Regs& r) {
-    off_t o = lseek((int)r.rdi, (off_t)r.rsi, (int)r.rdx);
+    int64_t o = FileSeek((int)r.rdi, (int64_t)r.rsi, (int)r.rdx);
     if (o < 0) SetErrno(errno);
     Ret(r, o);
 }
@@ -1036,6 +1093,18 @@ struct GuestThread {
     int phase = 0;
     bool signaled = false;
     int saved_lock_count = 0;
+    // Signals raised on the thread and, while handlers run, the states they interrupted (innermost last).
+    std::vector<int> pending_signals;
+    struct Interrupted {
+        X86Regs regs;
+        bool blocked, timed_out, signaled;
+        std::function<bool()> ready;
+        int64_t deadline_us;
+        const char* waiting_for;
+        uint64_t call_rip;
+        int phase;
+    };
+    std::vector<Interrupted> interrupted;
 };
 std::vector<std::unique_ptr<GuestThread>> g_threads;
 size_t g_cur = 0;
@@ -1263,16 +1332,113 @@ void EventFlagSet(X86Regs& r) { g_eventflags[r.rdi] |= r.rsi; r.rax = 0; }
 void EventFlagClear(X86Regs& r) { g_eventflags[r.rdi] &= r.rsi; r.rax = 0; }
 void EventFlagDelete(X86Regs& r) { g_eventflags.erase(r.rdi); r.rax = 0; }
 
-// No kernel events are produced yet (no GPU/video emulation): waits time out, or last one vblank.
+// kernel event queues. A registered event is delivered once per trigger (graphics and video-out
+// events behave as EV_CLEAR); triggers that arrive before delivery queue up behind it.
+constexpr int64_t kSceErrEbadf = (int32_t)0x80020009, kSceErrEnoentEq = (int32_t)0x80020002;
+constexpr int16_t kEvfiltUser = -11;
+struct EqRegistration {
+    uint64_t ident;
+    int16_t filter;
+    uint64_t udata;
+    bool triggered = false;
+    uint32_t fflags = 0;
+    int64_t data = 0;
+    std::deque<int64_t> pending;
+};
+std::unordered_map<uint64_t, std::vector<EqRegistration>> g_equeues;
+
+EqRegistration* FindRegistration(uint64_t eq, uint64_t ident, int16_t filter) {
+    auto it = g_equeues.find(eq);
+    if (it == g_equeues.end()) return nullptr;
+    for (auto& reg : it->second)
+        if (reg.ident == ident && reg.filter == filter) return &reg;
+    return nullptr;
+}
+int64_t AddRegistration(uint64_t eq, uint64_t ident, int16_t filter, uint64_t udata) {
+    auto it = g_equeues.find(eq);
+    if (it == g_equeues.end()) return kSceErrEbadf;
+    if (EqRegistration* reg = FindRegistration(eq, ident, filter)) reg->udata = udata;
+    else it->second.push_back(EqRegistration{ident, filter, udata});
+    return 0;
+}
+void TriggerRegistration(EqRegistration& reg, int64_t data) {
+    if (reg.triggered) { reg.pending.push_back(data); return; }
+    reg.triggered = true;
+    reg.fflags++;
+    reg.data = data;
+}
+bool AnyTriggered(uint64_t eq) {
+    auto it = g_equeues.find(eq);
+    if (it == g_equeues.end()) return true;  // deleted: let the waiter fail
+    for (auto& reg : it->second)
+        if (reg.triggered) return true;
+    return false;
+}
+
+void EqueueCreate(X86Regs& r) {
+    uint64_t h = NewHandle();
+    Wr<uint64_t>(r.rdi, h);
+    g_equeues[h];
+    r.rax = 0;
+}
+void EqueueDelete(X86Regs& r) { Ret(r, g_equeues.erase(r.rdi) ? 0 : kSceErrEbadf); }
 void EqueueWait(X86Regs& r) {  // (eq, events*, num, out*, timeout*)
-    if (FirstEntry(r)) {
-        Park("event queue", [] { return false; }, r.r8 ? (int64_t)Rd<uint32_t>(r.r8) : 16667);
+    const uint64_t eq = r.rdi;
+    auto it = g_equeues.find(eq);
+    if (it == g_equeues.end()) { EndCall(); Ret(r, kSceErrEbadf); return; }
+    int delivered = 0;
+    for (auto& reg : it->second) {
+        if (delivered >= (int)r.rdx) break;
+        if (!reg.triggered) continue;
+        const uint64_t ev = r.rsi + 32ull * delivered++;  // {ident, filter, flags, fflags, data, udata}
+        Wr<uint64_t>(ev, reg.ident);
+        Wr<int16_t>(ev + 8, reg.filter);
+        Wr<uint16_t>(ev + 10, 0);
+        Wr<uint32_t>(ev + 12, reg.fflags);
+        Wr<int64_t>(ev + 16, reg.data);
+        Wr<uint64_t>(ev + 24, reg.udata);
+        if (!reg.pending.empty()) {
+            reg.data = reg.pending.front();
+            reg.pending.pop_front();
+            reg.fflags = 1;
+        } else {
+            reg.triggered = false;
+            reg.fflags = 0;
+            reg.data = 0;
+        }
+    }
+    if (delivered) { EndCall(); if (r.rcx) Wr<int32_t>(r.rcx, delivered); r.rax = 0; return; }
+    const int64_t timeout = r.r8 ? (int64_t)Rd<uint32_t>(r.r8) : -1;
+    if (timeout == 0 || (!FirstEntry(r) && Cur()->timed_out)) {
+        EndCall();
+        if (r.rcx) Wr<int32_t>(r.rcx, 0);
+        Ret(r, kSceErrEtimedout);
         return;
     }
-    EndCall();
-    if (r.rcx) Wr<int32_t>(r.rcx, 0);
-    Ret(r, r.r8 ? kSceErrEtimedout : 0);
+    Park("event queue", [eq] { return AnyTriggered(eq); }, timeout);
 }
+void AddUserEvent(X86Regs& r) { Ret(r, AddRegistration(r.rdi, (uint32_t)r.rsi, kEvfiltUser, 0)); }
+void TriggerUserEvent(X86Regs& r) {  // (eq, id, udata)
+    EqRegistration* reg = FindRegistration(r.rdi, (uint32_t)r.rsi, kEvfiltUser);
+    if (!reg) { Ret(r, kSceErrEnoentEq); return; }
+    reg->udata = r.rdx;
+    TriggerRegistration(*reg, 0);
+    r.rax = 0;
+}
+void DeleteUserEvent(X86Regs& r) {
+    auto it = g_equeues.find(r.rdi);
+    if (it == g_equeues.end()) { Ret(r, kSceErrEbadf); return; }
+    auto& v = it->second;
+    v.erase(std::remove_if(v.begin(), v.end(), [&](const EqRegistration& reg) {
+        return reg.ident == (uint32_t)r.rsi && reg.filter == kEvfiltUser;
+    }), v.end());
+    r.rax = 0;
+}
+void GetEventId(X86Regs& r) { r.rax = Rd<uint64_t>(r.rdi); }
+void GetEventFilter(X86Regs& r) { Ret(r, Rd<int16_t>(r.rdi + 8)); }
+void GetEventFflags(X86Regs& r) { r.rax = Rd<uint32_t>(r.rdi + 12); }
+void GetEventData(X86Regs& r) { r.rax = Rd<uint64_t>(r.rdi + 16); }
+void GetEventUserData(X86Regs& r) { r.rax = Rd<uint64_t>(r.rdi + 24); }
 
 // sleeping and yielding
 void SleepUs(X86Regs& r, int64_t us) {
@@ -1284,6 +1450,82 @@ void Usleep(X86Regs& r) { SleepUs(r, (int64_t)(uint32_t)r.rdi); }
 void Nanosleep(X86Regs& r) { SleepUs(r, Rd<int64_t>(r.rdi) * 1000000 + Rd<int64_t>(r.rdi + 8) / 1000); }
 void SleepSec(X86Regs& r) { SleepUs(r, (int64_t)(uint32_t)r.rdi * 1000000); }
 void YieldNow(X86Regs& r) { r.rax = 0; L.cpu->RequestYield(false); }
+
+// signals: sceKernelInstallExceptionHandler(signum, handler(int, Ucontext*)) and sceKernelRaiseException(thread,
+// signum), which Unity's garbage collector uses to stop and resume threads. A raised signal runs the handler on
+// the target thread the next time it is scheduled, waking it if it is blocked; when the handler returns, the
+// interrupted state comes back, including a blocking call that was in progress.
+constexpr int kSignals = 128;
+uint64_t g_signal_handlers[kSignals] = {};
+uint64_t g_sigreturn_trap = 0;
+void InstallExceptionHandler(X86Regs& r) {
+    const int sig = (int)r.rdi;
+    if (sig <= 0 || sig >= kSignals) { Ret(r, kSceErrEinval); return; }
+    g_signal_handlers[sig] = r.rsi;
+    r.rax = 0;
+}
+void RemoveExceptionHandler(X86Regs& r) {
+    const int sig = (int)r.rdi;
+    if (sig <= 0 || sig >= kSignals) { Ret(r, kSceErrEinval); return; }
+    g_signal_handlers[sig] = 0;
+    r.rax = 0;
+}
+void RaiseException(X86Regs& r) {
+    GuestThread* t = ThreadByHandle(r.rdi);
+    const int sig = (int)r.rsi;
+    if (!t || t->finished) { Ret(r, kSceErrEsrch); return; }
+    if (sig <= 0 || sig >= kSignals) { Ret(r, kSceErrEinval); return; }
+    if (g_signal_handlers[sig]) t->pending_signals.push_back(sig);
+    r.rax = 0;
+    if (t == Cur()) L.cpu->RequestYield(false);  // delivered when the scheduler resumes it
+}
+// Calls the handler for the current thread's first pending signal. The Ucontext (0x500 bytes, mcontext at
+// 0x40 in FreeBSD's layout) goes below the red zone, and the handler returns to the sigreturn trap.
+void DeliverSignal(GuestThread& t) {
+    const int sig = t.pending_signals.front();
+    t.pending_signals.erase(t.pending_signals.begin());
+    X86Regs& r = L.cpu->Regs();
+    t.interrupted.push_back({r, t.blocked, t.timed_out, t.signaled, t.ready, t.deadline_us, t.waiting_for,
+                             t.call_rip, t.phase});
+    const uint64_t ctx = (r.rsp - 128 - 0x500) & ~0xfull;
+    if (auto* p = Ptr(ctx, 0x500)) memset(p, 0, 0x500);
+    const uint64_t mc = ctx + 0x40;
+    const uint64_t gprs[] = {r.rdi, r.rsi, r.rdx, r.rcx, r.r8, r.r9, r.rax, r.rbx, r.rbp, r.r10, r.r11, r.r12, r.r13,
+                             r.r14, r.r15};
+    for (int i = 0; i < 15; i++) Wr<uint64_t>(mc + 8 + 8 * i, gprs[i]);
+    Wr<uint64_t>(mc + 0xa0, r.rip);
+    Wr<uint64_t>(mc + 0xb0, r.rflags);
+    Wr<uint64_t>(mc + 0xb8, r.rsp);
+    Wr<uint64_t>(mc + 0x440, r.fs_base);
+    r.rsp = ctx - 8;
+    Wr<uint64_t>(r.rsp, g_sigreturn_trap);
+    r.rip = g_signal_handlers[sig];
+    r.rdi = (uint64_t)sig;
+    r.rsi = ctx;
+    t.blocked = t.timed_out = t.signaled = false;
+    t.ready = nullptr;
+    t.deadline_us = -1;
+    t.waiting_for = "";
+    t.call_rip = 0;
+    t.phase = 0;
+}
+void SigReturn(X86Regs& r) {
+    GuestThread* t = Cur();
+    if (t->interrupted.empty()) { printf("[threads] signal return without a signal on %s\n", t->name.c_str()); return; }
+    GuestThread::Interrupted f = std::move(t->interrupted.back());
+    t->interrupted.pop_back();
+    r = f.regs;
+    t->blocked = f.blocked;
+    t->timed_out = f.timed_out;
+    t->signaled = f.signaled;
+    t->ready = std::move(f.ready);
+    t->deadline_us = f.deadline_us;
+    t->waiting_for = f.waiting_for;
+    t->call_rip = f.call_rip;
+    t->phase = f.phase;
+    // End the slice without executing the trap's RET; a restored blocking call is retried when it can proceed.
+    L.cpu->RequestYield(true);
+}
 
 // thread lifecycle
 uint64_t g_tls_image = 0, g_tls_filesz = 0, g_tls_size = 0, g_tls_align = 16;
@@ -1392,6 +1634,222 @@ void SwitchTo(size_t i) {
     g_errno_addr = g_threads[i]->errno_addr;
 }
 
+// --- streamed files ---
+// Big media stays in the frontend. A read requests the 1 MB chunks it lacks and parks its thread
+// until they arrive; chunks are evicted least-recently-used beyond a memory budget.
+constexpr uint64_t kChunkSize = 1 << 20;  // keep in sync with web/app.js
+constexpr uint64_t kChunkBudget = 384ull << 20;
+constexpr int kLazyFdBase = 0x40000;
+struct LazyFile {
+    std::string path;
+    uint64_t size;
+    std::unordered_map<uint64_t, std::vector<uint8_t>> chunks;
+};
+std::vector<LazyFile> g_lazy;
+std::unordered_map<std::string, int> g_lazy_by_path;
+struct LazyFdState { int file; uint64_t offset; };
+std::unordered_map<int, LazyFdState> g_lazy_fds;
+int g_next_lazy_fd = kLazyFdBase;
+std::deque<std::pair<int, uint64_t>> g_lazy_queue;     // chunks to fetch
+std::set<std::pair<int, uint64_t>> g_lazy_requested;   // queued or being fetched
+std::list<std::pair<int, uint64_t>> g_lazy_lru;        // most recently used first
+uint64_t g_lazy_bytes = 0;
+
+int LazyOpen(const std::string& path) {
+    auto it = g_lazy_by_path.find(path);
+    if (it == g_lazy_by_path.end()) return -1;
+    const int fd = g_next_lazy_fd++;
+    g_lazy_fds[fd] = {it->second, 0};
+    return fd;
+}
+bool IsLazyFd(int fd) { return fd >= kLazyFdBase && g_lazy_fds.count(fd); }
+void LazyClose(int fd) { g_lazy_fds.erase(fd); }
+bool ChunksPresent(int file, uint64_t off, uint64_t n, bool request) {
+    bool all = true;
+    LazyFile& f = g_lazy[file];
+    for (uint64_t c = off / kChunkSize; c <= (off + n - 1) / kChunkSize; c++) {
+        if (f.chunks.count(c)) continue;
+        all = false;
+        if (request && g_lazy_requested.insert({file, c}).second) g_lazy_queue.emplace_back(file, c);
+    }
+    return all;
+}
+void CopyFromChunks(int file, uint64_t off, uint64_t n, uint8_t* dst) {
+    LazyFile& f = g_lazy[file];
+    for (uint64_t done = 0; done < n;) {
+        const uint64_t c = (off + done) / kChunkSize, in = (off + done) % kChunkSize;
+        const auto& chunk = f.chunks[c];
+        const uint64_t take = in < chunk.size() ? std::min<uint64_t>(n - done, chunk.size() - in) : 0;
+        if (!take) break;
+        memcpy(dst + done, chunk.data() + in, take);
+        done += take;
+        g_lazy_lru.remove({file, c});
+        g_lazy_lru.emplace_front(file, c);
+    }
+}
+int64_t LazyRead(X86Regs& r, int fd, uint64_t buf, uint64_t n, int64_t pos) {
+    (void)r;
+    LazyFdState& s = g_lazy_fds[fd];
+    LazyFile& f = g_lazy[s.file];
+    const uint64_t off = pos >= 0 ? (uint64_t)pos : s.offset;
+    if (off >= f.size || n == 0) return 0;
+    n = std::min(n, f.size - off);
+    uint8_t* dst = Ptr(buf, n);
+    if (!dst) { errno = EFAULT; return -1; }
+    const int file = s.file;
+    if (!ChunksPresent(file, off, n, true)) {
+        Park("streamed file", [file, off, n] { return ChunksPresent(file, off, n, false); });
+        return kParked;
+    }
+    CopyFromChunks(file, off, n, dst);
+    if (pos < 0) s.offset = off + n;
+    return (int64_t)n;
+}
+int64_t LazySeek(int fd, int64_t off, int whence) {
+    LazyFdState& s = g_lazy_fds[fd];
+    const int64_t base = whence == SEEK_CUR ? (int64_t)s.offset : whence == SEEK_END ? (int64_t)g_lazy[s.file].size : 0;
+    if (base + off < 0) { errno = EINVAL; return -1; }
+    s.offset = (uint64_t)(base + off);
+    return (int64_t)s.offset;
+}
+void LazyStatOf(int file, struct stat* st) {
+    *st = {};
+    st->st_mode = S_IFREG | 0444;
+    st->st_size = (off_t)g_lazy[file].size;
+    st->st_ino = (ino_t)(0x10000 + file);
+}
+bool LazyStatPath(const std::string& path, struct stat* st) {
+    auto it = g_lazy_by_path.find(path);
+    if (it == g_lazy_by_path.end()) return false;
+    LazyStatOf(it->second, st);
+    return true;
+}
+bool LazyStatFd(int fd, struct stat* st) {
+    auto it = g_lazy_fds.find(fd);
+    if (it == g_lazy_fds.end()) return false;
+    LazyStatOf(it->second.file, st);
+    return true;
+}
+
+// controller (ScePadData is 120 bytes; see KytyPS5 src/libs/padData.h)
+struct PadState { uint32_t buttons = 0; uint8_t lx = 128, ly = 128, rx = 128, ry = 128, l2 = 0, r2 = 0; } g_pad;
+void FillPadData(uint64_t dst) {
+    uint8_t d[120] = {};
+    const float orientation_w = 1.0f;
+    const uint64_t timestamp = (uint64_t)UsecSinceStart();
+    memcpy(d + 0, &g_pad.buttons, 4);
+    d[4] = g_pad.lx; d[5] = g_pad.ly; d[6] = g_pad.rx; d[7] = g_pad.ry; d[8] = g_pad.l2; d[9] = g_pad.r2;
+    memcpy(d + 24, &orientation_w, 4);
+    d[76] = 1;  // connected
+    memcpy(d + 80, &timestamp, 8);
+    d[104] = 1;  // connected count
+    if (auto* p = Ptr(dst, sizeof(d))) memcpy(p, d, sizeof(d));
+}
+void PadReadState(X86Regs& r) { FillPadData(r.rsi); r.rax = 0; }
+void PadRead(X86Regs& r) { FillPadData(r.rsi); r.rax = 1; }  // one sample
+void PadGetControllerInformation(X86Regs& r) {
+    uint8_t d[28] = {};
+    const float pixel_density = 44.86f;
+    const uint16_t res_x = 1920, res_y = 943;
+    memcpy(d + 0, &pixel_density, 4);
+    memcpy(d + 4, &res_x, 2);
+    memcpy(d + 6, &res_y, 2);
+    d[8] = d[9] = 13;  // stick dead zones
+    d[11] = 1;         // connected count
+    d[12] = 1;         // connected
+    if (auto* p = Ptr(r.rsi, sizeof(d))) memcpy(p, d, sizeof(d));
+    r.rax = 0;
+}
+
+// audio out: (user, type, index, len, freq, param) opens a port; each output call blocks until the previous
+// buffer of `len` samples would have finished playing. Ports of type 0 (main) and 1 (BGM) are mixed to stereo.
+struct AudioPort { int type = 0; uint32_t len = 256, freq = 48000, format = 1; int64_t next_us = 0; };
+std::map<int, AudioPort> g_audio_ports;
+int g_next_audio_port = 1;
+std::vector<float> g_audio_mix;
+void AudioOutOpen(X86Regs& r) {
+    AudioPort p;
+    p.type = (int)r.rsi;
+    p.len = std::max<uint32_t>((uint32_t)r.rcx, 1);
+    p.freq = (uint32_t)r.r8 ? (uint32_t)r.r8 : 48000;
+    p.format = (uint32_t)r.r9 & 0xff;
+    if (g_audio_ports.empty()) InitAudio(48000, 2);
+    const int handle = g_next_audio_port++;
+    g_audio_ports[handle] = p;
+    printf("[audio] port %d: type %d, %u samples at %u Hz, format %u\n", handle, p.type, p.len, p.freq, p.format);
+    r.rax = handle;
+}
+void AudioOutClose(X86Regs& r) { g_audio_ports.erase((int)r.rdi); r.rax = 0; }
+// Converts one buffer to interleaved stereo float (formats: 0-2 s16 mono/stereo/8ch, 3-5 float, 6/7 8ch std).
+void MixAudio(const AudioPort& p, uint64_t src) {
+    const int fmt = (int)p.format;
+    const int channels = (fmt == 0 || fmt == 3) ? 1 : (fmt == 1 || fmt == 4) ? 2 : 8;
+    const bool is_float = fmt == 3 || fmt == 4 || fmt == 5 || fmt == 7;
+    const uint64_t bytes = (uint64_t)p.len * channels * (is_float ? 4 : 2);
+    const uint8_t* s = Ptr(src, bytes);
+    if (!s) return;
+    g_audio_mix.resize((size_t)p.len * 2);
+    auto sample = [&](uint32_t i, int c) -> float {
+        const uint64_t at = ((uint64_t)i * channels + c) * (is_float ? 4 : 2);
+        if (is_float) { float f; memcpy(&f, s + at, 4); return f; }
+        int16_t v; memcpy(&v, s + at, 2); return v / 32768.0f;
+    };
+    for (uint32_t i = 0; i < p.len; i++) {
+        g_audio_mix[2 * i] = sample(i, 0);
+        g_audio_mix[2 * i + 1] = sample(i, channels > 1 ? 1 : 0);
+    }
+    PushAudioSamples(g_audio_mix.data(), (int)p.len);
+}
+void AudioOutOutput(X86Regs& r) {
+    auto it = g_audio_ports.find((int)r.rdi);
+    if (it == g_audio_ports.end()) { Ret(r, (int32_t)0x80260004); return; }  // SCE_AUDIO_OUT_ERROR_INVALID_PORT
+    AudioPort& p = it->second;
+    const int64_t now = UsecSinceStart();
+    if (FirstEntry(r) && now < p.next_us) {
+        Park("audio output", [] { return false; }, p.next_us - now);
+        return;
+    }
+    EndCall();
+    // Fall behind by more than a few buffers (the emulator is slower than real time) and the clock restarts.
+    const int64_t period = (int64_t)p.len * 1000000 / p.freq;
+    p.next_us = std::max(p.next_us, now - 4 * period) + period;
+    if (r.rsi && (p.type == 0 || p.type == 1)) MixAudio(p, r.rsi);
+    r.rax = 0;
+}
+void AudioOutOutputs(X86Regs& r) {  // (SceAudioOutOutputParam {handle, ptr}[num], num)
+    if (FirstEntry(r)) {
+        int64_t wait = 0;
+        const int64_t now = UsecSinceStart();
+        for (uint32_t i = 0; i < (uint32_t)r.rsi; i++) {
+            auto it = g_audio_ports.find(Rd<int32_t>(r.rdi + 16ull * i));
+            if (it != g_audio_ports.end()) wait = std::max(wait, it->second.next_us - now);
+        }
+        if (wait > 0) { Park("audio output", [] { return false; }, wait); return; }
+    }
+    EndCall();
+    const int64_t now = UsecSinceStart();
+    for (uint32_t i = 0; i < (uint32_t)r.rsi; i++) {
+        auto it = g_audio_ports.find(Rd<int32_t>(r.rdi + 16ull * i));
+        if (it == g_audio_ports.end()) continue;
+        AudioPort& p = it->second;
+        const int64_t period = (int64_t)p.len * 1000000 / p.freq;
+        p.next_us = std::max(p.next_us, now - 4 * period) + period;
+        const uint64_t ptr = Rd<uint64_t>(r.rdi + 16ull * i + 8);
+        if (ptr && (p.type == 0 || p.type == 1)) MixAudio(p, ptr);
+    }
+    r.rax = 0;
+}
+void AudioOutGetPortState(X86Regs& r) {  // SceAudioOutPortState: output, channel, volume, reroute counter, flag
+    uint8_t d[32] = {};
+    const uint16_t output = 1, volume = 127;  // connected primary
+    memcpy(d + 0, &output, 2);
+    d[2] = 2;
+    memcpy(d + 4, &volume, 2);
+    if (auto* p = Ptr(r.rsi, sizeof(d))) memcpy(p, d, sizeof(d));
+    r.rax = 0;
+}
+void AjmInitialize(X86Regs& r) { Wr<uint32_t>(r.rsi, 1); r.rax = 0; }  // (reserved, SceAjmContextId*)
+
 struct Impl { const char* name; HleFn fn; };
 const Impl kImpls[] = {
     {"memcpy", Memcpy}, {"memmove", Memcpy}, {"memset", Memset}, {"memcmp", Memcmp}, {"memchr", Memchr},
@@ -1477,7 +1935,12 @@ const Impl kImpls[] = {
     {"sceKernelPollEventFlag", EventFlagPoll}, {"sceKernelSetEventFlag", EventFlagSet},
     {"sceKernelClearEventFlag", EventFlagClear}, {"sceKernelDeleteEventFlag", EventFlagDelete},
     {"sceKernelCancelEventFlag", RetZero},
-    {"sceKernelCreateEqueue", WriteNewHandle}, {"sceKernelWaitEqueue", EqueueWait},
+    {"sceKernelCreateEqueue", EqueueCreate}, {"sceKernelDeleteEqueue", EqueueDelete},
+    {"sceKernelWaitEqueue", EqueueWait}, {"sceKernelAddUserEvent", AddUserEvent},
+    {"sceKernelAddUserEventEdge", AddUserEvent}, {"sceKernelTriggerUserEvent", TriggerUserEvent},
+    {"sceKernelDeleteUserEvent", DeleteUserEvent}, {"sceKernelGetEventId", GetEventId},
+    {"sceKernelGetEventFilter", GetEventFilter}, {"sceKernelGetEventFflags", GetEventFflags},
+    {"sceKernelGetEventData", GetEventData}, {"sceKernelGetEventUserData", GetEventUserData},
     {"usleep", Usleep}, {"sceKernelUsleep", Usleep}, {"nanosleep", Nanosleep}, {"sceKernelNanosleep", Nanosleep},
     {"sleep", SleepSec}, {"sceKernelSleep", SleepSec}, {"__tls_get_addr", TlsGetAddr},
     {"sceUserServiceInitialize", RetZero}, {"sceUserServiceGetInitialUser", UserServiceGetInitialUser},
@@ -1491,7 +1954,15 @@ const Impl kImpls[] = {
     {"sceAppContentInitialize", RetZero}, {"sceAppContentAppParamGetInt", AppParamGetInt},
     {"sceNpGetAccountIdA", NpGetAccountId},
     {"sceKernelDlsym", Dlsym},
-    {"sceVideoOutOpen", VideoOutOpen}, {"scePadOpen", ReturnHandle1}, {"sceAudioOutOpen", ReturnHandle1},
+    {"scePadOpen", ReturnHandle1}, {"scePadInit", RetZero},
+    {"sceKernelInstallExceptionHandler", InstallExceptionHandler},
+    {"sceKernelRemoveExceptionHandler", RemoveExceptionHandler}, {"sceKernelRaiseException", RaiseException},
+    {"sceAudioOutInit", RetZero}, {"sceAudioOutOpen", AudioOutOpen}, {"sceAudioOutClose", AudioOutClose},
+    {"sceAudioOutOutput", AudioOutOutput}, {"sceAudioOutOutputs", AudioOutOutputs},
+    {"sceAudioOutSetVolume", RetZero}, {"sceAudioOutGetPortState", AudioOutGetPortState},
+    {"sceAjmInitialize", AjmInitialize}, {"sceAjmModuleRegister", RetZero},
+    {"scePadReadState", PadReadState}, {"scePadRead", PadRead},
+    {"scePadGetControllerInformation", PadGetControllerInformation},
     {"_Znwm", Malloc}, {"_Znam", Malloc}, {"_ZnwmRKSt9nothrow_t", Malloc}, {"_ZnamRKSt9nothrow_t", Malloc},
     {"_ZdlPv", Free}, {"_ZdaPv", Free}, {"_ZdlPvm", Free}, {"_ZdaPvm", Free},
     {"_ZnwmSt11align_val_t", AlignedNew}, {"_ZnamSt11align_val_t", AlignedNew},
@@ -1538,6 +2009,12 @@ void HleInit(const HleLayout& layout) {
     g_exit_trap = g_heap.Alloc(16, 16);
     Wr<uint8_t>(g_exit_trap, 0xC3);
     L.cpu->RegisterHLEFunction(g_exit_trap, [](X86Regs& r, uint64_t) { FinishThread(r.rax); });
+    g_sigreturn_trap = g_heap.Alloc(16, 16);
+    Wr<uint8_t>(g_sigreturn_trap, 0xC3);
+    L.cpu->RegisterHLEFunction(g_sigreturn_trap, [](X86Regs& r, uint64_t) { SigReturn(r); });
+    AgcSetup(layout);
+    GpuSetup(layout);
+    AmprSetup(layout);
     g_tm = g_heap.Alloc(64, 16);
     g_ctype = g_heap.Alloc(257 * 2, 16);
     g_tolower = g_heap.Alloc(257 * 2, 16);
@@ -1581,11 +2058,17 @@ uint64_t HleVmAlloc(uint64_t size, uint64_t align, int prot, HleRegion kind, con
 uint64_t HleMalloc(uint64_t size, uint64_t align) { return g_heap.Alloc(size, align); }
 
 HleFn HleFind(const std::string& nid) {
+    if (HleFn f = AgcFind(nid)) return f;
+    if (HleFn f = GpuFind(nid)) return f;
+    if (HleFn f = AmprFind(nid)) return f;
     auto it = g_by_nid.find(nid);
     return it == g_by_nid.end() ? nullptr : it->second;
 }
 
 const char* HleName(const std::string& nid) {
+    if (const char* n = AgcName(nid)) return n;
+    if (const char* n = GpuName(nid)) return n;
+    if (const char* n = AmprName(nid)) return n;
     auto it = g_names.find(nid);
     return it == g_names.end() ? nullptr : it->second;
 }
@@ -1603,11 +2086,139 @@ void HleRegisterModuleTls(uint64_t module_id, uint64_t image, uint64_t filesz, u
     g_module_tls[module_id] = {image, filesz, memsz, align};
 }
 
+void HlePark(const char* what, std::function<bool()> ready) { Park(what, std::move(ready)); }
+bool HleFirstEntry(const X86Regs& r) { return FirstEntry(r); }
+void HleEndCall() { EndCall(); }
+
+bool HleFileSize(const std::string& guest_path, uint64_t* size) {
+    struct stat st{};
+    if (FileStatPath(HostPath(guest_path), &st) < 0) return false;
+    *size = (uint64_t)st.st_size;
+    return true;
+}
+
+int64_t HleReadFileRange(const std::string& guest_path, uint64_t off, uint64_t n, uint64_t guest_dst, bool* pending) {
+    *pending = false;
+    const std::string path = HostPath(guest_path);
+    auto lazy = g_lazy_by_path.find(path);
+    if (lazy != g_lazy_by_path.end()) {
+        const int file = lazy->second;
+        if (off >= g_lazy[file].size || n == 0) return 0;
+        n = std::min(n, g_lazy[file].size - off);
+        uint8_t* dst = Ptr(guest_dst, n);
+        if (!dst) return -1;
+        if (!ChunksPresent(file, off, n, true)) { *pending = true; return 0; }
+        CopyFromChunks(file, off, n, dst);
+        return (int64_t)n;
+    }
+    uint8_t* dst = Ptr(guest_dst, n);
+    if (!dst) return -1;
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return -1;
+    const int64_t got = pread(fd, dst, n, (off_t)off);
+    close(fd);
+    return got;
+}
+
+int HleLazyRegister(const std::string& path, uint64_t size) {
+    g_lazy.push_back({path, size, {}});
+    g_lazy_by_path[path] = (int)g_lazy.size() - 1;
+    return (int)g_lazy.size() - 1;
+}
+
+bool HleLazyNextRequest(int* file, uint64_t* chunk) {
+    if (g_lazy_queue.empty()) return false;
+    std::tie(*file, *chunk) = g_lazy_queue.front();
+    g_lazy_queue.pop_front();
+    return true;
+}
+
+void HleLazyProvide(int file, uint64_t chunk, const uint8_t* data, uint64_t length) {
+    g_lazy_requested.erase({file, chunk});
+    if (file < 0 || file >= (int)g_lazy.size()) return;
+    auto& slot = g_lazy[file].chunks[chunk];
+    g_lazy_bytes -= slot.size();
+    slot.assign(data, data + length);
+    g_lazy_bytes += length;
+    g_lazy_lru.remove({file, chunk});
+    g_lazy_lru.emplace_front(file, chunk);
+    while (g_lazy_bytes > kChunkBudget && g_lazy_lru.size() > 1) {
+        auto [vf, vc] = g_lazy_lru.back();
+        g_lazy_lru.pop_back();
+        auto it = g_lazy[vf].chunks.find(vc);
+        if (it == g_lazy[vf].chunks.end()) continue;
+        g_lazy_bytes -= it->second.size();
+        g_lazy[vf].chunks.erase(it);
+    }
+}
+
+void HleSetPadState(uint32_t buttons, float lx, float ly, float rx, float ry, float l2, float r2) {
+    // frontend bit -> SCE_PAD_BUTTON_* (cross, circle, square, triangle, L1, R1, L2, R2, options,
+    // L3, R3, up, down, left, right, touch pad)
+    static const uint32_t kMap[][2] = {
+        {1u << 0, 0x4000}, {1u << 1, 0x2000}, {1u << 2, 0x8000}, {1u << 3, 0x1000}, {1u << 4, 0x400},
+        {1u << 5, 0x800}, {1u << 6, 0x100}, {1u << 7, 0x200}, {1u << 9, 0x8}, {1u << 10, 0x2},
+        {1u << 11, 0x4}, {1u << 12, 0x10}, {1u << 13, 0x40}, {1u << 14, 0x80}, {1u << 15, 0x20},
+        {1u << 17, 0x100000},
+    };
+    uint32_t sce = 0;
+    for (const auto& m : kMap)
+        if (buttons & m[0]) sce |= m[1];
+    auto axis = [](float v) { return (uint8_t)std::clamp(128.0f + v * 127.5f, 0.0f, 255.0f); };
+    auto trigger = [](float v) { return (uint8_t)std::clamp(v * 255.0f, 0.0f, 255.0f); };
+    g_pad.buttons = sce;
+    g_pad.lx = axis(lx);
+    g_pad.ly = axis(ly);
+    g_pad.rx = axis(rx);
+    g_pad.ry = axis(ry);
+    g_pad.l2 = trigger(l2);
+    g_pad.r2 = trigger(r2);
+}
+
+void HleEqueueAddEvent(uint64_t eq, uint64_t ident, int16_t filter, uint64_t udata) {
+    AddRegistration(eq, ident, filter, udata);
+}
+
+void HleEqueueDeleteEvent(uint64_t eq, uint64_t ident, int16_t filter) {
+    auto it = g_equeues.find(eq);
+    if (it == g_equeues.end()) return;
+    auto& v = it->second;
+    v.erase(std::remove_if(v.begin(), v.end(), [&](const EqRegistration& reg) {
+        return reg.ident == ident && reg.filter == filter;
+    }), v.end());
+}
+
+void HleEqueueTrigger(uint64_t ident, int16_t filter, uint64_t data) {
+    for (auto& [eq, regs] : g_equeues)
+        for (auto& reg : regs)
+            if (reg.ident == ident && reg.filter == filter) TriggerRegistration(reg, (int64_t)data);
+}
+
+void HleDumpThreads(const std::function<std::string(uint64_t)>& name_of) {
+    for (size_t i = 0; i < g_threads.size(); i++) {
+        GuestThread& t = *g_threads[i];
+        // The current thread's registers live in the interpreter until the next switch.
+        const X86Regs& r = i == g_cur ? L.cpu->Regs() : t.regs;
+        const std::string at = name_of(r.rip);
+        std::string frames;
+        uint64_t fp = r.rbp;
+        for (int k = 0; k < 10 && fp && !(fp & 7) && Ptr(fp, 16); k++, fp = Rd<uint64_t>(fp)) {
+            char buf[24];
+            snprintf(buf, sizeof(buf), " 0x%llx", (unsigned long long)Rd<uint64_t>(fp + 8));
+            frames += buf;
+        }
+        printf("[threads] %-28s %-30s rip=0x%llx%s%s ret=0x%llx frames:%s\n", t.name.c_str(),
+               t.finished ? "finished" : t.blocked ? t.waiting_for : "runnable", (unsigned long long)r.rip,
+               at.empty() ? "" : " ", at.c_str(), (unsigned long long)Rd<uint64_t>(r.rsp), frames.c_str());
+    }
+}
+
 X86Exception HleRunThreads(uint64_t budget, uint64_t* executed) {
     constexpr uint64_t kQuantum = 20000;
     static bool reported_all_blocked = false;
     uint64_t done = 0;
     while (done < budget && !g_halt) {
+        GpuPoll();
         const int64_t now = UsecSinceStart();
         bool sleeping = false;
         for (auto& t : g_threads) {
@@ -1623,7 +2234,8 @@ X86Exception HleRunThreads(uint64_t budget, uint64_t* executed) {
         size_t pick = SIZE_MAX;
         for (size_t k = 1; k <= n && pick == SIZE_MAX; k++) {
             size_t i = (g_cur + k) % n;
-            if (!g_threads[i]->blocked && !g_threads[i]->finished) pick = i;
+            const GuestThread& t = *g_threads[i];
+            if ((!t.blocked || !t.pending_signals.empty()) && !t.finished) pick = i;
         }
         if (pick == SIZE_MAX) {
             if (!sleeping && !reported_all_blocked) {
@@ -1637,6 +2249,7 @@ X86Exception HleRunThreads(uint64_t budget, uint64_t* executed) {
         }
         reported_all_blocked = false;
         SwitchTo(pick);
+        if (!Cur()->pending_signals.empty()) DeliverSignal(*Cur());
         const uint64_t before = L.cpu->GetInstructionCount();
         const X86Exception ex = L.cpu->Run(std::min(kQuantum, budget - done));
         done += L.cpu->GetInstructionCount() - before;

@@ -6,6 +6,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace KytyWeb {
 
@@ -90,6 +91,10 @@ public:
     void SetTraceEnabled(bool enable) { trace_enabled_ = enable; }
     // Logs the first hits on an address (with the return address at [rsp]), for debugging.
     void AddWatch(uint64_t addr) { watch_[addr] = 0; }
+    // Logs the instructions that change the quadword at addr (checked between instructions, so HLE writes count).
+    void AddMemoryWatch(uint64_t addr) { mem_watch_.push_back({addr, ReadMemory64(addr), 0}); }
+    // Names code addresses in watch logs (e.g. which SDK function an import stub belongs to).
+    void SetAddressNamer(std::function<std::string(uint64_t)> namer) { address_namer_ = std::move(namer); }
 
     // From an HLE handler: end the time slice. With retry, the call's RET is not executed, so RIP stays
     // on the import stub and the same call runs again when the thread is next scheduled.
@@ -136,6 +141,10 @@ private:
     int trace_count_ = 0;
     std::unordered_map<uint64_t, HLEHandler> hle_handlers_;
     std::unordered_map<uint64_t, int> watch_;
+    struct MemoryWatch { uint64_t addr, value; int hits; };
+    std::vector<MemoryWatch> mem_watch_;
+    uint64_t prev_rip_ = 0;
+    std::function<std::string(uint64_t)> address_namer_;
     bool yield_ = false, yield_retry_ = false;
     mutable bool fault_ = false;
     mutable uint64_t fault_addr_ = 0;

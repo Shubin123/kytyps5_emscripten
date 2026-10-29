@@ -26,6 +26,9 @@ set(WEB_SRC
   ${KYTY_WEB_SRC}/input_web.cpp
   ${KYTY_WEB_SRC}/x86_interpreter.cpp
   ${KYTY_WEB_SRC}/hle.cpp
+  ${KYTY_WEB_SRC}/agc.cpp
+  ${KYTY_WEB_SRC}/gpu.cpp
+  ${KYTY_WEB_SRC}/ampr.cpp
 )
 
 add_executable(kytyps5 ${WEB_SRC})
@@ -45,11 +48,11 @@ set(LINK_FLAGS
   "-sPTHREAD_POOL_SIZE=4"
   "-sALLOW_MEMORY_GROWTH=1"
   "-sINITIAL_MEMORY=268435456"
-  "-sMAXIMUM_MEMORY=2147483648"
+  "-sMAXIMUM_MEMORY=4294967296"
   "-sSTACK_SIZE=4194304"
   "-sFORCE_FILESYSTEM=1"
-  "-sEXPORTED_FUNCTIONS=['_main','_kyty_init','_kyty_load_game','_kyty_frame','_kyty_input','_kyty_input_values','_kyty_audio_callback','_kyty_get_screen_width','_kyty_get_screen_height','_kyty_watch','_malloc','_free']"
-  "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','MEMFS','setValue','getValue','UTF8ToString','stringToUTF8','addFunction']"
+  "-sEXPORTED_FUNCTIONS=['_main','_kyty_init','_kyty_load_game','_kyty_frame','_kyty_input','_kyty_input_values','_kyty_audio_callback','_kyty_audio_read','_kyty_get_screen_width','_kyty_get_screen_height','_kyty_watch','_kyty_watch_memory','_kyty_lazy_register','_kyty_lazy_request','_kyty_lazy_provide','_malloc','_free']"
+  "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','MEMFS','setValue','getValue','UTF8ToString','stringToUTF8','addFunction','HEAPU8','HEAPF32']"
   "-sENVIRONMENT=web,worker"
   "-sMODULARIZE=1"
   "-sEXPORT_NAME=KytyPS5"
@@ -60,6 +63,7 @@ set(LINK_FLAGS
   "-sMAX_WEBGL_VERSION=2"
   "-lidbfs.js"
   "-pthread"
+  "-fwasm-exceptions"
 )
 
 if(NOT KYTY_WEB_DEV)

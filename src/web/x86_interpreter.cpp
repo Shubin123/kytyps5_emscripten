@@ -307,9 +307,39 @@ X86Exception X86Interpreter::Step() {
                 bool ok = a >= mem_base_addr_ && a - mem_base_addr_ + 8 <= mem_size_;
                 printf(" %llx", ok ? (unsigned long long)LoadLE<uint64_t>(mem_base_ + (a - mem_base_addr_)) : 0ULL);
             }
+            printf(" [rsi]=");
+            for (int i = 0; i < 8; i++) {
+                uint64_t a = regs_.rsi + 8 * i;
+                bool ok = a >= mem_base_addr_ && a - mem_base_addr_ + 8 <= mem_size_;
+                printf(" %llx", ok ? (unsigned long long)LoadLE<uint64_t>(mem_base_ + (a - mem_base_addr_)) : 0ULL);
+            }
             printf("\n");
         }
     }
+    for (auto& w : mem_watch_) {
+        const uint64_t v = ReadMemory64(w.addr);
+        if (v != w.value && w.hits++ < 16) {
+            const std::string name = address_namer_ ? address_namer_(prev_rip_) : std::string();
+            // After a call's RET, [rsp-8] is the return address and rdi/rsi/rdx usually still hold its arguments.
+            printf("[watch] 0x%llx changed 0x%llx -> 0x%llx after the instruction at 0x%llx%s%s (instruction %llu, "
+                   "rsp=0x%llx [rsp]=0x%llx [rsp-8]=0x%llx rax=0x%llx rdi=0x%llx rsi=0x%llx rdx=0x%llx)\n",
+                   (unsigned long long)w.addr, (unsigned long long)w.value, (unsigned long long)v,
+                   (unsigned long long)prev_rip_, name.empty() ? "" : " = ", name.c_str(),
+                   (unsigned long long)insn_count_, (unsigned long long)regs_.rsp,
+                   (unsigned long long)ReadMemory64(regs_.rsp), (unsigned long long)ReadMemory64(regs_.rsp - 8),
+                   (unsigned long long)regs_.rax, (unsigned long long)regs_.rdi, (unsigned long long)regs_.rsi,
+                   (unsigned long long)regs_.rdx);
+            printf("[watch]   return addresses (frame pointers):");
+            uint64_t fp = regs_.rbp;
+            for (int i = 0; i < 12 && fp && (fp & 7) == 0 && fp - mem_base_addr_ + 16 <= mem_size_; i++) {
+                printf(" 0x%llx", (unsigned long long)LoadLE<uint64_t>(mem_base_ + (fp + 8 - mem_base_addr_)));
+                fp = LoadLE<uint64_t>(mem_base_ + (fp - mem_base_addr_));
+            }
+            printf("\n");
+        }
+        w.value = v;
+    }
+    prev_rip_ = regs_.rip;
     const uint64_t start_rip = regs_.rip;
     auto it = hle_handlers_.find(regs_.rip);
     if (it != hle_handlers_.end()) {
@@ -2457,7 +2487,32 @@ X86Exception X86Interpreter::DecodeAndExecute() {
             if (op2 == 0x38 || op2 == 0x3A) {
                 vex_mmmmm = op2 == 0x38 ? 2 : 3;
                 vex_opcode = ReadMemory8(regs_.rip++);
-                if (vex_opcode >= 0xF0) {  // CRC32/MOVBE/ADCX are not SIMD
+                if (op2 == 0x38 && (vex_opcode == 0xF0 || vex_opcode == 0xF1)) {
+                    uint8_t modrm = read_modrm();
+                    uint64_t a; bool is_reg;
+                    decode_rm(modrm, &a, &is_reg);
+                    const int reg = reg_field(modrm);
+                    if (has_repne) {  // CRC32: CRC-32C, reflected polynomial 0x82F63B78
+                        const int bits = vex_opcode == 0xF0 ? 8 : (rex_w ? 64 : has_op_size ? 16 : 32);
+                        const uint64_t src = read_from_rm(a, is_reg, bits);
+                        uint32_t crc = (uint32_t)RegByIndex(reg);
+                        for (int i = 0; i < bits / 8; i++) {
+                            crc ^= (uint8_t)(src >> (8 * i));
+                            for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0x82F63B78u & (0u - (crc & 1u)));
+                        }
+                        RegByIndex(reg) = crc;
+                    } else {  // MOVBE: F0 loads, F1 stores, byte-swapped
+                        if (is_reg) return X86Exception::InvalidOpcode;
+                        auto bswap = [&](uint64_t v) -> uint64_t {
+                            return op_size == 64 ? __builtin_bswap64(v)
+                                 : op_size == 32 ? __builtin_bswap32((uint32_t)v) : __builtin_bswap16((uint16_t)v);
+                        };
+                        if (vex_opcode == 0xF0) set_reg_bits(reg, bswap(read_from_rm(a, false, op_size)), op_size);
+                        else write_to_rm(a, false, bswap(truncate(RegByIndex(reg), op_size)), op_size);
+                    }
+                    break;
+                }
+                if (vex_opcode >= 0xF0) {  // ADCX/ADOX and friends are not SIMD
                     fprintf(stderr, "[x86] Unimplemented 0F %02X %02X at RIP=0x%llX\n", op2, vex_opcode,
                             (unsigned long long)(regs_.rip - 3));
                     return X86Exception::InvalidOpcode;
@@ -2611,6 +2666,22 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 if (is_reg) memcpy(src, regs_.xmm[(int)a & 15], 16); else mem_in(a, src, esz);
                 for (int i = 0; i < width; i += esz) memcpy(out + i, src, esz);
                 ymm_set(reg_field(modrm), out, vex_L);
+            } else if (vex_mmmmm == 2 && vex_pp == 1 && (op == 0x8C || op == 0x8E || (op >= 0x2C && op <= 0x2F))) {
+                // VPMASKMOVD/Q, VMASKMOVPS/PD: elements whose mask (vvvv) sign bit is set are loaded (others
+                // zeroed) or stored (others untouched); masked-off elements never touch memory.
+                uint8_t modrm = read_modrm(); uint64_t a; bool is_reg; decode_rm(modrm, &a, &is_reg);
+                if (is_reg) return X86Exception::InvalidOpcode;
+                const int esz = (op == 0x8C || op == 0x8E) ? (vex_W ? 8 : 4) : (op & 1) ? 8 : 4;
+                const bool store = op == 0x8E || op == 0x2E || op == 0x2F;
+                uint8_t mask[32] = {}, data[32] = {};
+                ymm_get(vex_vvvv, mask);
+                if (store) ymm_get(reg_field(modrm), data);
+                for (int i = 0; i < width; i += esz) {
+                    if (!(mask[i + esz - 1] & 0x80)) continue;
+                    if (store) mem_out(a + i, data + i, esz);
+                    else mem_in(a + i, data + i, esz);
+                }
+                if (!store) ymm_set(reg_field(modrm), data, vex_L);
             } else if (vex_mmmmm == 2 && (op == 0x0E || op == 0x0F || op == 0x17)) {
                 // VTESTPS/VTESTPD test sign bits; VPTEST tests every bit
                 uint8_t modrm = read_modrm(); uint64_t a; bool is_reg; decode_rm(modrm, &a, &is_reg);
@@ -3115,13 +3186,19 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 break;
             }
 
-            // VMOVD / VMOVQ r/m32/64, xmm
+            // F3: VMOVQ xmm, xmm/m64 (load, upper bits zeroed). 66: VMOVD / VMOVQ r/m32/64, xmm.
             case 0x7E: {
                 uint8_t modrm = read_modrm();
                 int reg = reg_field(modrm) | (rex_r << 3);
                 uint64_t rm_addr; bool rm_is_reg;
                 decode_rm(modrm, &rm_addr, &rm_is_reg);
-                if (rex_w) {
+                if (vex_pp == 2) {
+                    uint64_t val;
+                    if (rm_is_reg) memcpy(&val, regs_.xmm[(int)rm_addr & 15], 8);
+                    else val = ReadMemory64(rm_addr);
+                    memset(regs_.xmm[reg], 0, 16);
+                    memcpy(regs_.xmm[reg], &val, 8);
+                } else if (rex_w) {
                     uint64_t val;
                     memcpy(&val, regs_.xmm[reg], 8);
                     if (rm_is_reg) RegByIndex((int)rm_addr) = val;
@@ -3131,6 +3208,24 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                     memcpy(&val, regs_.xmm[reg], 4);
                     if (rm_is_reg) RegByIndex((int)rm_addr) = val;
                     else WriteMemory32(rm_addr, val);
+                }
+                break;
+            }
+
+            // 66: VMOVQ xmm/m64, xmm (a register destination gets its upper bits zeroed)
+            case 0xD6: {
+                if (vex_pp != 1) return X86Exception::InvalidOpcode;
+                uint8_t modrm = read_modrm();
+                int reg = reg_field(modrm) | (rex_r << 3);
+                uint64_t rm_addr; bool rm_is_reg;
+                decode_rm(modrm, &rm_addr, &rm_is_reg);
+                uint64_t val;
+                memcpy(&val, regs_.xmm[reg], 8);
+                if (rm_is_reg) {
+                    memset(regs_.xmm[(int)rm_addr & 15], 0, 16);
+                    memcpy(regs_.xmm[(int)rm_addr & 15], &val, 8);
+                } else {
+                    WriteMemory64(rm_addr, val);
                 }
                 break;
             }

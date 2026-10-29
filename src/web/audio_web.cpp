@@ -48,6 +48,21 @@ void PushAudioSamples(const float* samples, int count) {
 
 extern "C" {
 
+// Copies up to max_frames queued stereo frames into buffer and returns how many there were (no padding).
+int kyty_audio_read(float* buffer, int max_frames) {
+    if (!KytyWeb::g_audio_initialized || !buffer) return 0;
+    std::lock_guard<std::mutex> lock(KytyWeb::g_audio_mutex);
+    const int ch = KytyWeb::g_channels;
+    int n = 0;
+    while (n < max_frames && KytyWeb::g_ring_read != KytyWeb::g_ring_write) {
+        for (int c = 0; c < ch; c++)
+            buffer[n * ch + c] = KytyWeb::g_ring[(KytyWeb::g_ring_read * ch + c) % (KytyWeb::RING_SIZE * 2)];
+        KytyWeb::g_ring_read = (KytyWeb::g_ring_read + 1) % KytyWeb::RING_SIZE;
+        n++;
+    }
+    return n;
+}
+
 void kyty_audio_callback(float* buffer, int frames) {
     if (!KytyWeb::g_audio_initialized || !buffer) {
         if (buffer) memset(buffer, 0, frames * KytyWeb::g_channels * sizeof(float));
