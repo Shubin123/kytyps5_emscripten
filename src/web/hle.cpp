@@ -292,8 +292,17 @@ uint64_t NewHandle() {
     if (auto* p = Ptr(h, 64)) memset(p, 0, 64);
     return h;
 }
+// Reading the host clock is a call out to JavaScript and games poll it constantly, so guest time queries use a
+// reading the scheduler refreshes every time slice, re-read every 64 queries in between.
+int64_t g_clock_us = 0;
+int g_clock_queries = 0;
+void RefreshClock() {
+    g_clock_queries = 0;
+    g_clock_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - g_start).count();
+}
 int64_t UsecSinceStart() {
-    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - g_start).count();
+    if (++g_clock_queries >= 64) RefreshClock();
+    return g_clock_us;
 }
 int64_t UnixUsec() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -775,14 +784,18 @@ bool LazyStatPath(const std::string& path, struct stat* st);
 bool LazyStatFd(int fd, struct stat* st);
 void LazyClose(int fd);
 
+// Writes to the game's own log files (Unity's player log) are mirrored into the emulator log.
+std::set<int> g_log_fds;
 int FileOpen(const std::string& path, int flags) {
     int fd = LazyOpen(path);
     if (fd < 0) fd = open(path.c_str(), flags, 0666);
     else errno = 0;
     LogOpen(path, fd);
+    if (fd >= 0 && path.size() > 4 && path.compare(path.size() - 4, 4, ".log") == 0) g_log_fds.insert(fd);
     return fd;
 }
 int FileClose(int fd) {
+    g_log_fds.erase(fd);
     if (IsLazyFd(fd)) { LazyClose(fd); return 0; }
     return close(fd);
 }
@@ -819,6 +832,7 @@ int64_t WriteImpl(X86Regs& r, bool positional) {
     auto* p = Ptr(r.rsi, r.rdx);
     if (!p) { errno = EFAULT; return -1; }
     if (r.rdi == 1 || r.rdi == 2) { GameLog(std::string(reinterpret_cast<const char*>(p), r.rdx)); return (int64_t)r.rdx; }
+    if (g_log_fds.count((int)r.rdi)) GameLog(std::string(reinterpret_cast<const char*>(p), r.rdx));
     return positional ? pwrite((int)r.rdi, p, r.rdx, (off_t)r.rcx) : write((int)r.rdi, p, r.rdx);
 }
 void KernelWrite(X86Regs& r) { int64_t n = WriteImpl(r, false); Ret(r, n < 0 ? SceErr(errno) : n); }
@@ -966,14 +980,6 @@ void PosixMemalign(X86Regs& r) {
 void AlignedNew(X86Regs& r) { r.rax = g_heap.Alloc(r.rdi, r.rsi); }  // operator new(size, align)
 void Terminate(X86Regs&) { Halt("std::terminate called"); }
 void LengthError(X86Regs& r) { Halt(("std::length_error: " + Str(r.rdi, 200)).c_str()); }
-void CxaThrow(X86Regs& r) {
-    char buf[96];
-    snprintf(buf, sizeof(buf), "C++ exception thrown (type_info 0x%llx); exceptions are not supported yet",
-             (unsigned long long)r.rsi);
-    Halt(buf);
-}
-void CxaRethrow(X86Regs&) { Halt("C++ exception rethrown; exceptions are not supported yet"); }
-void CxaBeginCatch(X86Regs& r) { r.rax = r.rdi; }
 
 // libc: sorting with guest comparators
 void Qsort(X86Regs& r) {
@@ -1968,9 +1974,7 @@ const Impl kImpls[] = {
     {"_ZnwmSt11align_val_t", AlignedNew}, {"_ZnamSt11align_val_t", AlignedNew},
     {"_ZdlPvSt11align_val_t", Free}, {"_ZdlPvmSt11align_val_t", Free}, {"_ZdaPvSt11align_val_t", Free},
     {"posix_memalign", PosixMemalign}, {"_ZSt9terminatev", Terminate}, {"_ZSt14_Xlength_errorPKc", LengthError},
-    {"__cxa_guard_abort", RetZero}, {"__cxa_finalize", RetZero}, {"__cxa_allocate_exception", Malloc},
-    {"__cxa_free_exception", Free}, {"__cxa_throw", CxaThrow}, {"__cxa_rethrow", CxaRethrow},
-    {"__cxa_begin_catch", CxaBeginCatch}, {"__cxa_end_catch", RetZero},
+    {"__cxa_guard_abort", RetZero}, {"__cxa_finalize", RetZero},
     {"qsort", Qsort}, {"bsearch", Bsearch}, {"strftime", Strftime}, {"mktime", Mktime}, {"difftime", Difftime},
     {"sceRtcGetCurrentTick", RtcGetCurrentTick}, {"sceKernelGettimeofday", Gettimeofday},
     {"setlocale", Setlocale}, {"setvbuf", RetZero}, {"fgetc", Fgetc},
@@ -2058,6 +2062,7 @@ uint64_t HleVmAlloc(uint64_t size, uint64_t align, int prot, HleRegion kind, con
 uint64_t HleMalloc(uint64_t size, uint64_t align) { return g_heap.Alloc(size, align); }
 
 HleFn HleFind(const std::string& nid) {
+    if (HleFn f = EhFind(nid)) return f;
     if (HleFn f = AgcFind(nid)) return f;
     if (HleFn f = GpuFind(nid)) return f;
     if (HleFn f = AmprFind(nid)) return f;
@@ -2066,6 +2071,7 @@ HleFn HleFind(const std::string& nid) {
 }
 
 const char* HleName(const std::string& nid) {
+    if (const char* n = EhName(nid)) return n;
     if (const char* n = AgcName(nid)) return n;
     if (const char* n = GpuName(nid)) return n;
     if (const char* n = AmprName(nid)) return n;
@@ -2074,6 +2080,9 @@ const char* HleName(const std::string& nid) {
 }
 
 bool HleHaltRequested() { return g_halt; }
+uint64_t HleCurrentThread() { return Cur()->handle; }
+void HleFree(uint64_t addr) { g_heap.Free(addr); }
+void HleTerminate(const char* why) { Halt(why); }
 
 void HleSetStaticTls(uint64_t image, uint64_t filesz, uint64_t size, uint64_t align) {
     g_tls_image = image;
@@ -2219,7 +2228,8 @@ X86Exception HleRunThreads(uint64_t budget, uint64_t* executed) {
     uint64_t done = 0;
     while (done < budget && !g_halt) {
         GpuPoll();
-        const int64_t now = UsecSinceStart();
+        RefreshClock();
+        const int64_t now = g_clock_us;
         bool sleeping = false;
         for (auto& t : g_threads) {
             if (!t->blocked || t->finished) continue;

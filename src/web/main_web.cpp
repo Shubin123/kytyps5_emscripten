@@ -80,6 +80,7 @@ struct Elf64_Rela {
 constexpr uint32_t PT_LOAD    = 1;
 constexpr uint32_t PT_DYNAMIC = 2;
 constexpr uint32_t PT_TLS     = 7;
+constexpr uint32_t PT_GNU_EH_FRAME = 0x6474e550;
 constexpr uint32_t PT_SCE_DYNLIBDATA = 0x61000000;
 constexpr uint32_t PT_SCE_RELRO      = 0x61000010;
 constexpr uint32_t PT_SCE_COMMENT    = 0x6FFFFF00;
@@ -200,6 +201,12 @@ static size_t StubImport(const std::string& nid) {
         else r.rax = 0;
     });
     return idx;
+}
+
+// The stub an NID's import is bound to, or 0 if nothing imports it.
+static uint64_t StubOf(const std::string& nid) {
+    auto it = g_import_index.find(nid);
+    return it == g_import_index.end() ? 0 : g_imports[it->second].stub;
 }
 
 // The SDK function an import stub address belongs to, or "" for other addresses.
@@ -405,6 +412,8 @@ static int LoadPrx(const std::string& host_path, const std::string& name) {
         memcpy(g_emu_memory + (image - EMU_BASE_ADDR), file.data() + ph[i].p_offset, filesz);
         KytyWeb::HleRegisterModuleTls(id, image, filesz, ph[i].p_memsz, std::max<uint64_t>(ph[i].p_align, 16));
     }
+    for (int i = 0; i < eh->e_phnum; i++)
+        if (ph[i].p_type == PT_GNU_EH_FRAME) KytyWeb::EhRegisterModule(base, hi - lo, bias + ph[i].p_vaddr);
     DynInfo di = ReadDynamic(file.data(), ph, eh->e_phnum);
     m.init = di.init ? bias + di.init : 0;
     g_modules.push_back(m);
@@ -432,9 +441,10 @@ static void HleLoadStartModule(KytyWeb::X86Regs& r) {
     }
     const ModuleImage m = g_modules[id - 1];
     // module_start runs the module's own initialization (including DT_INIT), like _start does for the eboot.
+    // Without one, DT_INIT is the PRX's start routine: it takes the same (args, argp) and returns the result.
     int64_t start_ret = 0;
     if (m.start) start_ret = (int32_t)CallGuest(m.start, args, argp);
-    else if (m.init) CallGuest(m.init, 0, 0);
+    else if (m.init) start_ret = (int32_t)CallGuest(m.init, args, argp);
     printf("[loader] started %s (%s returned %lld)\n", name.c_str(), m.start ? "module_start" : "DT_INIT",
            (long long)start_ret);
     if (res) W32(res, (uint32_t)start_ret);
@@ -648,6 +658,10 @@ static bool LoadELF(const char* path) {
         return false;
     }
     KytyWeb::HleInit(layout);
+    KytyWeb::EhSetup(layout, StubOf);
+    for (int i = 0; i < ehdr->e_phnum; i++)
+        if (phdrs[i].p_type == PT_GNU_EH_FRAME)
+            KytyWeb::EhRegisterModule(load_base, highest_end - lowest_vaddr, reloc_offset + phdrs[i].p_vaddr);
 
     for (int i = 0; i < ehdr->e_phnum; i++) {
         const auto& ph = phdrs[i];

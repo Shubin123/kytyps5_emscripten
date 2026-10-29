@@ -1,5 +1,6 @@
 build-web/
 build-web-dev/
+build-prof/
 .cache/
 upstream/
 *.o

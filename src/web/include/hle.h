@@ -53,6 +53,18 @@ void AmprSetup(const HleLayout& layout);
 HleFn AmprFind(const std::string& nid);
 const char* AmprName(const std::string& nid);
 
+// C++ exceptions (unwind.cpp): __cxa_* and _Unwind_Resume over the guest's .eh_frame unwind tables.
+// stub_of gives the import stub an NID is bound to (0 if none); type_info vtables are identified that way.
+void EhSetup(const HleLayout& layout, std::function<uint64_t(const std::string&)> stub_of);
+void EhRegisterModule(uint64_t base, uint64_t size, uint64_t eh_frame_hdr);
+HleFn EhFind(const std::string& nid);
+const char* EhName(const std::string& nid);
+
+// The current guest thread's handle; HleFree releases HleMalloc memory; HleTerminate stops the game.
+uint64_t HleCurrentThread();
+void HleFree(uint64_t addr);
+void HleTerminate(const char* why);
+
 // For SDK functions outside hle.cpp. Park: the calling thread blocks and the same call re-executes
 // once `ready` holds (call from an HleFn, without modifying registers first). FirstEntry is false
 // while a parked call is being retried; EndCall marks it finished.

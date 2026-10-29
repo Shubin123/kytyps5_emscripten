@@ -11,6 +11,7 @@ if(NOT EMSCRIPTEN)
 endif()
 
 option(KYTY_WEB_DEV "Dev build (faster link, larger wasm)" OFF)
+option(KYTY_WEB_PROFILE "Keep function names in the wasm for browser profilers" OFF)
 
 set(KYTY_WEB_SRC "${CMAKE_SOURCE_DIR}/src/web")
 
@@ -29,6 +30,7 @@ set(WEB_SRC
   ${KYTY_WEB_SRC}/agc.cpp
   ${KYTY_WEB_SRC}/gpu.cpp
   ${KYTY_WEB_SRC}/ampr.cpp
+  ${KYTY_WEB_SRC}/unwind.cpp
 )
 
 add_executable(kytyps5 ${WEB_SRC})
@@ -41,6 +43,12 @@ target_compile_options(kytyps5 PRIVATE
   -Wall
   -Wno-unused-function
 )
+# The link step's -O3 only runs wasm-opt; the C++ itself has to be compiled optimized too.
+if(NOT KYTY_WEB_DEV)
+  target_compile_options(kytyps5 PRIVATE -O3)
+else()
+  target_compile_options(kytyps5 PRIVATE -O1 -g)
+endif()
 
 # Link flags
 set(LINK_FLAGS
@@ -70,6 +78,10 @@ if(NOT KYTY_WEB_DEV)
   list(APPEND LINK_FLAGS "-O3")
 else()
   list(APPEND LINK_FLAGS "-O1" "-gsource-map")
+endif()
+
+if(KYTY_WEB_PROFILE)
+  list(APPEND LINK_FLAGS "--profiling-funcs")
 endif()
 
 target_link_options(kytyps5 PRIVATE ${LINK_FLAGS})

@@ -110,8 +110,8 @@ public:
 private:
     X86Exception DecodeAndExecute();
     void UpdateFlags(uint64_t result, int bits);
-    void UpdateFlagsAdd(uint64_t a, uint64_t b, uint64_t result, int bits);
-    void UpdateFlagsSub(uint64_t a, uint64_t b, uint64_t result, int bits);
+    void UpdateFlagsAdd(uint64_t a, uint64_t b, uint64_t result, int bits, int carry = 0);
+    void UpdateFlagsSub(uint64_t a, uint64_t b, uint64_t result, int bits, int borrow = 0);
 
     bool GetCF() const { return (regs_.rflags >> 0) & 1; }
     bool GetPF() const { return (regs_.rflags >> 2) & 1; }
@@ -144,6 +144,17 @@ private:
     struct MemoryWatch { uint64_t addr, value; int hits; };
     std::vector<MemoryWatch> mem_watch_;
     uint64_t prev_rip_ = 0;
+    // AH/CH/DH/BH while an instruction runs (see RegByIndex); merged back into their registers after it.
+    uint64_t high8_[4] = {};
+    uint8_t high8_used_ = 0;
+    void FlushHigh8() {
+        for (int k = 0; k < 4; k++)
+            if (high8_used_ & (1 << k)) {
+                uint64_t& r = RegByIndex(k);
+                r = (r & ~0xFF00ull) | ((high8_[k] & 0xFF) << 8);
+            }
+        high8_used_ = 0;
+    }
     std::function<std::string(uint64_t)> address_namer_;
     bool yield_ = false, yield_retry_ = false;
     mutable bool fault_ = false;
