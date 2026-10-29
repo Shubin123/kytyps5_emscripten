@@ -16,6 +16,9 @@
 #include <fstream>
 #include <chrono>
 
+#include <sys/stat.h>
+#include <unordered_map>
+
 #include <emscripten.h>
 #include <emscripten/html5.h>
 
@@ -141,23 +144,53 @@ static double g_fps = 0.0;
 static int g_frame_count = 0;
 static SteadyClock::time_point g_fps_timer;
 
-// ---- Imported SDK functions ----
-// Each import gets a 16-byte stub holding RET; the interpreter runs the handler when RIP hits the stub.
+// ---- Modules, exports and imports ----
+// An import binds to another loaded module's export when one exists; otherwise to a 16-byte stub
+// holding RET, whose handler (an SDK implementation, or "return 0") runs when RIP reaches it.
+
+struct ModuleImage {
+    std::string name;
+    uint64_t base, size, init, start;
+};
+static std::vector<ModuleImage> g_modules;                 // module handle = index + 1; the eboot is 1
+static std::unordered_map<std::string, uint64_t> g_exports;  // NID -> address
 
 struct Import {
     std::string nid;
     const char* name;
     KytyWeb::HleFn fn;
     uint64_t calls;
+    uint64_t stub;
+    std::vector<std::pair<uint64_t, int64_t>> slots;  // (address, addend) currently holding stub + addend
+    bool linked;
 };
 static std::vector<Import> g_imports;
+static std::unordered_map<std::string, size_t> g_import_index;
 
-static void RegisterImport(const char* symbol, uint64_t stub_addr) {
-    std::string nid(symbol, strcspn(symbol, "#"));
+static void HleLoadStartModule(KytyWeb::X86Regs& r);
+
+static bool InEmu(uint64_t a, uint64_t n) { return a >= EMU_BASE_ADDR && n <= EMU_MEM_SIZE && a - EMU_BASE_ADDR <= EMU_MEM_SIZE - n; }
+static void W64(uint64_t a, uint64_t v) { if (InEmu(a, 8)) memcpy(g_emu_memory + (a - EMU_BASE_ADDR), &v, 8); }
+static void W32(uint64_t a, uint32_t v) { if (InEmu(a, 4)) memcpy(g_emu_memory + (a - EMU_BASE_ADDR), &v, 4); }
+static uint64_t R64(uint64_t a) { uint64_t v = 0; if (InEmu(a, 8)) memcpy(&v, g_emu_memory + (a - EMU_BASE_ADDR), 8); return v; }
+static std::string GuestStr(uint64_t a) {
+    std::string s;
+    while (InEmu(a, 1) && g_emu_memory[a - EMU_BASE_ADDR] && s.size() < 1024) s += (char)g_emu_memory[a++ - EMU_BASE_ADDR];
+    return s;
+}
+
+static size_t StubImport(const std::string& nid) {
+    auto it = g_import_index.find(nid);
+    if (it != g_import_index.end()) return it->second;
     size_t idx = g_imports.size();
-    g_imports.push_back({nid, KytyWeb::HleName(nid), KytyWeb::HleFind(nid), 0});
-    g_emu_memory[stub_addr - EMU_BASE_ADDR] = 0xC3;
-    g_cpu->RegisterHLEFunction(stub_addr, [idx](KytyWeb::X86Regs& r, uint64_t) {
+    uint64_t stub = HLE_STUB_BASE + idx * 16;
+    const char* name = KytyWeb::HleName(nid);
+    KytyWeb::HleFn fn = KytyWeb::HleFind(nid);
+    if (name && !strcmp(name, "sceKernelLoadStartModule")) fn = HleLoadStartModule;
+    g_imports.push_back({nid, name, fn, 0, stub, {}, false});
+    g_import_index[nid] = idx;
+    g_emu_memory[stub - EMU_BASE_ADDR] = 0xC3;
+    g_cpu->RegisterHLEFunction(stub, [idx](KytyWeb::X86Regs& r, uint64_t) {
         Import& imp = g_imports[idx];
         g_hle_call_count++;
         if (imp.calls++ == 0)
@@ -166,6 +199,272 @@ static void RegisterImport(const char* symbol, uint64_t stub_addr) {
         if (imp.fn) imp.fn(r);
         else r.rax = 0;
     });
+    return idx;
+}
+
+static void BindSymbol(uint64_t slot, const char* symbol, int64_t addend) {
+    std::string nid(symbol, strcspn(symbol, "#"));
+    auto e = g_exports.find(nid);
+    if (e != g_exports.end()) { W64(slot, e->second + addend); return; }
+    Import& imp = g_imports[StubImport(nid)];
+    imp.slots.emplace_back(slot, addend);
+    W64(slot, imp.stub + addend);
+}
+
+// Repoints slots bound to stubs at exports from modules loaded since.
+static void RelinkImports() {
+    for (auto& imp : g_imports) {
+        if (imp.linked || imp.slots.empty()) continue;
+        auto e = g_exports.find(imp.nid);
+        if (e == g_exports.end()) continue;
+        for (auto& [slot, addend] : imp.slots) W64(slot, e->second + addend);
+        imp.linked = true;
+        printf("[loader] bound %s to a module export\n", imp.name ? imp.name : imp.nid.c_str());
+    }
+}
+
+struct DynInfo {
+    uint64_t symtab = 0, strtab = 0, strsz = 0, syment = sizeof(Elf64_Sym), symtab_bytes = 0, hash = 0;
+    uint64_t rela = 0, relasz = 0, jmprel = 0, pltrelsz = 0, init = 0;
+};
+constexpr int64_t DT_HASH_TAG = 4, DT_INIT_TAG = 12, DT_SCE_SYMTABSZ = 0x6100003f;
+constexpr uint32_t R_X86_64_64 = 1, R_X86_64_DTPMOD64 = 16, R_X86_64_DTPOFF64 = 17;
+constexpr const char* kModuleStartNid = "BaOKcng8g88";  // module_start
+
+static DynInfo ReadDynamic(const uint8_t* file, const Elf64_Phdr* phdrs, int phnum) {
+    DynInfo di;
+    for (int i = 0; i < phnum; i++) {
+        if (phdrs[i].p_type != PT_DYNAMIC) continue;
+        for (auto* d = reinterpret_cast<const Elf64_Dyn*>(file + phdrs[i].p_offset); d->d_tag != DT_NULL; d++) {
+            switch (d->d_tag) {
+                case DT_SYMTAB:       di.symtab = d->d_un.d_ptr; break;
+                case DT_STRTAB:       di.strtab = d->d_un.d_ptr; break;
+                case DT_STRSZ:        di.strsz = d->d_un.d_val; break;
+                case DT_SYMENT:       di.syment = d->d_un.d_val; break;
+                case DT_RELA:         di.rela = d->d_un.d_ptr; break;
+                case DT_RELASZ:       di.relasz = d->d_un.d_val; break;
+                case DT_JMPREL:       di.jmprel = d->d_un.d_ptr; break;
+                case DT_PLTRELSZ:     di.pltrelsz = d->d_un.d_val; break;
+                case DT_INIT_TAG:     di.init = d->d_un.d_ptr; break;
+                case DT_HASH_TAG:     di.hash = d->d_un.d_ptr; break;
+                case DT_SCE_SYMTABSZ: di.symtab_bytes = d->d_un.d_val; break;
+            }
+        }
+    }
+    return di;
+}
+
+// Registers the image's exports and applies its relocations. `bias` maps image vaddrs to emulated addresses.
+static size_t LinkImage(const DynInfo& di, uint64_t bias, uint64_t module_id, ModuleImage& m) {
+    uint64_t nsyms = di.symtab_bytes ? di.symtab_bytes / di.syment
+                   : di.hash ? (R64(bias + di.hash) >> 32) : 0;  // DT_HASH: {nbucket, nchain}
+    auto sym_at = [&](uint64_t idx) -> const Elf64_Sym* {
+        uint64_t a = bias + di.symtab + idx * di.syment;
+        return di.symtab && InEmu(a, sizeof(Elf64_Sym)) ? reinterpret_cast<const Elf64_Sym*>(g_emu_memory + (a - EMU_BASE_ADDR)) : nullptr;
+    };
+    auto name_of = [&](const Elf64_Sym* s) -> const char* {
+        uint64_t a = s ? bias + di.strtab + s->st_name : 0;
+        return s && s->st_name < di.strsz && InEmu(a, 1) ? reinterpret_cast<const char*>(g_emu_memory + (a - EMU_BASE_ADDR)) : "";
+    };
+    size_t exported = 0;
+    for (uint64_t k = 0; k < nsyms; k++) {
+        const Elf64_Sym* s = sym_at(k);
+        const char* name = name_of(s);
+        if (!s || !s->st_shndx || !name[0]) continue;
+        std::string nid(name, strcspn(name, "#"));
+        if (nid == kModuleStartNid) { m.start = bias + s->st_value; continue; }
+        if (g_exports.emplace(nid, bias + s->st_value).second) exported++;
+    }
+    size_t bound = 0, unsupported = 0;
+    auto apply = [&](uint64_t table, uint64_t size) {
+        for (uint64_t off = 0; off + sizeof(Elf64_Rela) <= size; off += sizeof(Elf64_Rela)) {
+            uint64_t a = bias + table + off;
+            if (!InEmu(a, sizeof(Elf64_Rela))) break;
+            Elf64_Rela rel;
+            memcpy(&rel, g_emu_memory + (a - EMU_BASE_ADDR), sizeof(rel));
+            const uint32_t type = ELF64_R_TYPE(rel.r_info);
+            const uint64_t slot = bias + rel.r_offset;
+            const Elf64_Sym* s = ELF64_R_SYM(rel.r_info) ? sym_at(ELF64_R_SYM(rel.r_info)) : nullptr;
+            switch (type) {
+                case R_X86_64_RELATIVE: W64(slot, bias + rel.r_addend); break;
+                case R_X86_64_64: case R_X86_64_GLOB_DAT: case R_X86_64_JUMP_SLOT: {
+                    int64_t addend = type == R_X86_64_64 ? rel.r_addend : 0;
+                    if (!s) W64(slot, addend);
+                    else if (s->st_shndx) W64(slot, bias + s->st_value + addend);
+                    else { BindSymbol(slot, name_of(s), addend); bound++; }
+                    break;
+                }
+                case R_X86_64_DTPMOD64: W64(slot, module_id); break;
+                case R_X86_64_DTPOFF64: W64(slot, (s ? s->st_value : 0) + rel.r_addend); break;
+                default: unsupported++; break;
+            }
+        }
+    };
+    if (di.rela) apply(di.rela, di.relasz);
+    if (di.jmprel) apply(di.jmprel, di.pltrelsz);
+    printf("[loader] %s: %zu exports, %zu import slots bound%s\n", m.name.c_str(), exported, bound,
+           unsupported ? " (some relocation types unsupported)" : "");
+    return bound;
+}
+
+// Runs guest code at `fn` to completion from inside an SDK call, then restores the caller's registers.
+constexpr uint64_t GUEST_RETURN_TRAP = PROC_ARGS_ADDR - 0x10;
+static bool g_guest_returned = false;
+
+static uint64_t CallGuest(uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2 = 0) {
+    static bool trap_ready = false;
+    if (!trap_ready) {
+        g_emu_memory[GUEST_RETURN_TRAP - EMU_BASE_ADDR] = 0xC3;
+        g_cpu->RegisterHLEFunction(GUEST_RETURN_TRAP, [](KytyWeb::X86Regs&, uint64_t) { g_guest_returned = true; });
+        trap_ready = true;
+    }
+    KytyWeb::X86Regs saved = g_cpu->Regs();
+    auto& r = g_cpu->Regs();
+    r.rdi = a0;
+    r.rsi = a1;
+    r.rdx = a2;
+    r.rsp = ((saved.rsp - 512) & ~0xFULL) - 8;  // below the caller's red zone; aligned as after a call
+    W64(r.rsp, GUEST_RETURN_TRAP);
+    r.rip = fn;
+    const bool outer = g_guest_returned;
+    g_guest_returned = false;
+    // Other threads can't run during a nested call, so a call that keeps parking can never finish.
+    uint64_t parked_rip = 0, parked_retries = 0;
+    for (uint64_t steps = 0; !g_guest_returned; steps++) {
+        const uint64_t rip = r.rip;
+        auto ex = g_cpu->Step();
+        if (ex == KytyWeb::X86Exception::Yield) {
+            if (r.rip == rip && rip == parked_rip && ++parked_retries > 100000) {
+                printf("[loader] guest call to 0x%llx is blocked waiting on another thread, which can't run here\n",
+                       (unsigned long long)fn);
+                break;
+            }
+            if (r.rip == rip) parked_rip = rip;
+            continue;
+        }
+        parked_retries = 0;
+        if ((ex != KytyWeb::X86Exception::None && ex != KytyWeb::X86Exception::HLECall &&
+             ex != KytyWeb::X86Exception::Syscall) || KytyWeb::HleHaltRequested()) {
+            printf("[loader] guest call to 0x%llx stopped (exception %d at RIP=0x%llx)\n",
+                   (unsigned long long)fn, (int)ex, (unsigned long long)r.rip);
+            break;
+        }
+        if (steps > 3000000000ULL) { printf("[loader] guest call to 0x%llx did not return\n", (unsigned long long)fn); break; }
+    }
+    uint64_t ret = r.rax;
+    r = saved;
+    g_guest_returned = outer;
+    return ret;
+}
+
+static int LoadPrx(const std::string& host_path, const std::string& name) {
+    FILE* f = fopen(host_path.c_str(), "rb");
+    if (!f) return -1;
+    std::vector<uint8_t> file;
+    fseek(f, 0, SEEK_END);
+    file.resize(ftell(f));
+    fseek(f, 0, SEEK_SET);
+    size_t got = fread(file.data(), 1, file.size(), f);
+    fclose(f);
+    if (got != file.size() || file.size() < sizeof(Elf64_Ehdr) || memcmp(file.data(), "\x7f" "ELF", 4) != 0) {
+        printf("[loader] %s is not a decrypted ELF\n", host_path.c_str());
+        return -1;
+    }
+    auto* eh = reinterpret_cast<const Elf64_Ehdr*>(file.data());
+    auto* ph = reinterpret_cast<const Elf64_Phdr*>(file.data() + eh->e_phoff);
+    uint64_t lo = UINT64_MAX, hi = 0;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type != PT_LOAD) continue;
+        lo = std::min(lo, ph[i].p_vaddr);
+        hi = std::max(hi, ph[i].p_vaddr + ph[i].p_memsz);
+    }
+    if (lo == UINT64_MAX) return -1;
+    uint64_t base = KytyWeb::HleVmAlloc(hi - lo, 0x10000, 7, KytyWeb::HleRegion::Image, name.c_str());
+    if (!base) return -1;
+    const uint64_t bias = base - lo;
+    memset(g_emu_memory + (base - EMU_BASE_ADDR), 0, hi - lo);
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type != PT_LOAD || !ph[i].p_filesz) continue;
+        uint64_t n = std::min<uint64_t>(ph[i].p_filesz, file.size() - std::min<uint64_t>(ph[i].p_offset, file.size()));
+        memcpy(g_emu_memory + (bias + ph[i].p_vaddr - EMU_BASE_ADDR), file.data() + ph[i].p_offset, n);
+    }
+    ModuleImage m{name, base, hi - lo, 0, 0};
+    const uint64_t id = g_modules.size() + 1;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type != PT_TLS || !ph[i].p_memsz) continue;
+        // Each thread gets its own copy of this image on its first __tls_get_addr for the module.
+        uint64_t filesz = ph[i].p_offset + ph[i].p_filesz <= file.size() ? ph[i].p_filesz : 0;
+        uint64_t image = KytyWeb::HleMalloc(std::max<uint64_t>(filesz, 1), 16);
+        memcpy(g_emu_memory + (image - EMU_BASE_ADDR), file.data() + ph[i].p_offset, filesz);
+        KytyWeb::HleRegisterModuleTls(id, image, filesz, ph[i].p_memsz, std::max<uint64_t>(ph[i].p_align, 16));
+    }
+    DynInfo di = ReadDynamic(file.data(), ph, eh->e_phnum);
+    m.init = di.init ? bias + di.init : 0;
+    g_modules.push_back(m);
+    LinkImage(di, bias, id, g_modules.back());
+    RelinkImports();
+    printf("[loader] loaded %s at 0x%llx (0x%llx bytes)\n", name.c_str(), (unsigned long long)base,
+           (unsigned long long)(hi - lo));
+    return (int)id;
+}
+
+static void HleLoadStartModule(KytyWeb::X86Regs& r) {
+    const std::string guest = GuestStr(r.rdi);
+    const uint64_t args = r.rsi, argp = r.rdx, res = r.r9;
+    const std::string host = guest.rfind("/app0", 0) == 0 ? "/game" + guest.substr(5) : guest;
+    const std::string name = guest.substr(guest.find_last_of('/') + 1);
+    int id = -1;
+    for (const std::string& p : {host + ".esbak", host}) {
+        struct stat st;
+        if (stat(p.c_str(), &st) == 0 && (id = LoadPrx(p, name)) > 0) break;
+    }
+    if (id <= 0) {
+        printf("[loader] cannot load module %s\n", guest.c_str());
+        r.rax = (uint64_t)(int64_t)(int32_t)0x80020002;
+        return;
+    }
+    const ModuleImage m = g_modules[id - 1];
+    // module_start runs the module's own initialization (including DT_INIT), like _start does for the eboot.
+    int64_t start_ret = 0;
+    if (m.start) start_ret = (int32_t)CallGuest(m.start, args, argp);
+    else if (m.init) CallGuest(m.init, 0, 0);
+    printf("[loader] started %s (%s returned %lld)\n", name.c_str(), m.start ? "module_start" : "DT_INIT",
+           (long long)start_ret);
+    if (res) W32(res, (uint32_t)start_ret);
+    r.rax = (uint64_t)id;
+}
+
+
+// Printed once when execution makes no SDK calls for several frames, to diagnose spin loops.
+static void DumpStall() {
+    const auto& r = g_cpu->Regs();
+    const char* names[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+                             "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
+    const uint64_t vals[16] = {r.rax, r.rcx, r.rdx, r.rbx, r.rsp, r.rbp, r.rsi, r.rdi,
+                               r.r8, r.r9, r.r10, r.r11, r.r12, r.r13, r.r14, r.r15};
+    printf("[stall] register state at RIP=0x%llx\n", (unsigned long long)r.rip);
+    for (int i = 0; i < 16; i++) {
+        printf("[stall] %-3s = 0x%llx", names[i], (unsigned long long)vals[i]);
+        uint64_t v = vals[i];
+        if (v >= EMU_BASE_ADDR && v + 32 <= EMU_BASE_ADDR + EMU_MEM_SIZE) {
+            printf("  ->");
+            for (int b = 0; b < 32; b++) printf(" %02x", g_emu_memory[v - EMU_BASE_ADDR + b]);
+        }
+        printf("\n");
+    }
+    std::string trace;
+    uint64_t fp = r.rbp;
+    for (int depth = 0; depth < 16 && fp >= EMU_BASE_ADDR && fp + 16 <= EMU_BASE_ADDR + EMU_MEM_SIZE; depth++) {
+        uint64_t next, ret;
+        memcpy(&next, g_emu_memory + (fp - EMU_BASE_ADDR), 8);
+        memcpy(&ret, g_emu_memory + (fp + 8 - EMU_BASE_ADDR), 8);
+        char buf[24];
+        snprintf(buf, sizeof(buf), " 0x%llx", (unsigned long long)ret);
+        trace += buf;
+        if (next <= fp) break;
+        fp = next;
+    }
+    printf("[stall] return addresses (frame pointers):%s\n", trace.c_str());
 }
 
 static void LogTopImports() {
@@ -327,6 +626,7 @@ static bool LoadELF(const char* path) {
     uint64_t image_end = load_base + (highest_end - lowest_vaddr);
     KytyWeb::HleLayout layout{};
     layout.cpu = g_cpu;
+    layout.call_guest = [](uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2) { return CallGuest(fn, a0, a1, a2); };
     layout.mem = g_emu_memory;
     layout.base = EMU_BASE_ADDR;
     layout.size = EMU_MEM_SIZE;
@@ -366,100 +666,16 @@ static bool LoadELF(const char* path) {
         memcpy(g_emu_memory + (tls_block - EMU_BASE_ADDR), elf_base + tls_offset, tls_filesz);
     memcpy(g_emu_memory + (thread_ptr - EMU_BASE_ADDR), &thread_ptr, 8);
     g_cpu->Regs().fs_base = thread_ptr;
+    uint64_t tls_image = KytyWeb::HleMalloc(std::max<uint64_t>(tls_filesz, 1), 16);
+    memcpy(g_emu_memory + (tls_image - EMU_BASE_ADDR), g_emu_memory + (tls_block - EMU_BASE_ADDR), tls_filesz);
+    KytyWeb::HleSetStaticTls(tls_image, tls_filesz, tls_size, tls_align);
     printf("[loader] TLS: 0x%llx bytes, thread pointer 0x%llx\n",
            (unsigned long long)tls_size, (unsigned long long)thread_ptr);
 
-    // Process PT_DYNAMIC for relocations and PLT/GOT patching
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        if (phdrs[i].p_type != PT_DYNAMIC) continue;
-
-        auto* dyn = reinterpret_cast<Elf64_Dyn*>(elf_base + phdrs[i].p_offset);
-        uint64_t jmprel_vaddr = 0, pltrelsz = 0;
-        uint64_t rela_vaddr = 0, relasz = 0;
-        uint64_t symtab_vaddr = 0, strtab_vaddr = 0, strsz = 0;
-        uint64_t syment = sizeof(Elf64_Sym);
-
-        for (auto* d = dyn; d->d_tag != DT_NULL; d++) {
-            switch (d->d_tag) {
-                case DT_JMPREL:   jmprel_vaddr = d->d_un.d_ptr; break;
-                case DT_PLTRELSZ: pltrelsz = d->d_un.d_val; break;
-                case DT_RELA:     rela_vaddr = d->d_un.d_ptr; break;
-                case DT_RELASZ:   relasz = d->d_un.d_val; break;
-                case DT_SYMTAB:   symtab_vaddr = d->d_un.d_ptr; break;
-                case DT_STRTAB:   strtab_vaddr = d->d_un.d_ptr; break;
-                case DT_STRSZ:    strsz = d->d_un.d_val; break;
-                case DT_SYMENT:   syment = d->d_un.d_val; break;
-            }
-        }
-
-        printf("[loader] dynamic: JMPREL=0x%llx (%llu bytes), SYMTAB=0x%llx, STRTAB=0x%llx\n",
-               (unsigned long long)jmprel_vaddr, (unsigned long long)pltrelsz,
-               (unsigned long long)symtab_vaddr, (unsigned long long)strtab_vaddr);
-
-        // Memory offsets: data at original vaddr V is at g_emu_memory[V + reloc_offset - EMU_BASE_ADDR]
-        auto mem_off = [&](uint64_t vaddr) -> uint64_t {
-            return vaddr + reloc_offset - EMU_BASE_ADDR;
-        };
-
-        auto sym_name = [&](uint64_t r_info) -> const char* {
-            if (!symtab_vaddr || !strtab_vaddr) return "";
-            uint64_t sym_off = mem_off(symtab_vaddr) + ELF64_R_SYM(r_info) * syment;
-            if (sym_off + sizeof(Elf64_Sym) > EMU_MEM_SIZE) return "";
-            auto* sym = reinterpret_cast<Elf64_Sym*>(g_emu_memory + sym_off);
-            uint64_t strtab_off = mem_off(strtab_vaddr);
-            uint64_t name_off = strtab_off + sym->st_name;
-            if (name_off >= strtab_off + strsz || name_off >= EMU_MEM_SIZE) return "";
-            return reinterpret_cast<const char*>(g_emu_memory + name_off);
-        };
-        auto patch_import = [&](const Elf64_Rela* rela) {
-            uint64_t stub_addr = HLE_STUB_BASE + g_imports.size() * 16;
-            uint64_t got_off = rela->r_offset + reloc_offset - EMU_BASE_ADDR;
-            if (got_off + 8 <= EMU_MEM_SIZE)
-                memcpy(g_emu_memory + got_off, &stub_addr, 8);
-            RegisterImport(sym_name(rela->r_info), stub_addr);
-        };
-
-        // Process JUMP_SLOT relocations — patch GOT to point to HLE stubs
-        if (jmprel_vaddr && pltrelsz) {
-            uint64_t jmprel_off = mem_off(jmprel_vaddr);
-            int num_jmprel = pltrelsz / sizeof(Elf64_Rela);
-            for (int j = 0; j < num_jmprel; j++) {
-                if (jmprel_off + (j + 1) * sizeof(Elf64_Rela) > EMU_MEM_SIZE) break;
-                auto* rela = reinterpret_cast<Elf64_Rela*>(g_emu_memory + jmprel_off + j * sizeof(Elf64_Rela));
-                if (ELF64_R_TYPE(rela->r_info) == R_X86_64_JUMP_SLOT) patch_import(rela);
-            }
-            printf("[loader] patched %zu GOT entries\n", g_imports.size());
-        }
-
-        // Process R_X86_64_RELATIVE relocations
-        if (rela_vaddr && relasz) {
-            uint64_t rela_off = mem_off(rela_vaddr);
-            int num_rela = relasz / sizeof(Elf64_Rela);
-            int patched = 0;
-
-            for (int j = 0; j < num_rela; j++) {
-                if (rela_off + (j + 1) * sizeof(Elf64_Rela) > EMU_MEM_SIZE) break;
-                auto* rela = reinterpret_cast<Elf64_Rela*>(g_emu_memory + rela_off + j * sizeof(Elf64_Rela));
-                uint32_t type = ELF64_R_TYPE(rela->r_info);
-
-                if (type == R_X86_64_RELATIVE) {
-                    uint64_t addr_off = rela->r_offset + reloc_offset - EMU_BASE_ADDR;
-                    if (addr_off + 8 <= EMU_MEM_SIZE) {
-                        uint64_t val = (uint64_t)rela->r_addend + reloc_offset;
-                        *reinterpret_cast<uint64_t*>(g_emu_memory + addr_off) = val;
-                        patched++;
-                    }
-                } else if (type == R_X86_64_GLOB_DAT) {
-                    patch_import(rela);
-                    patched++;
-                }
-            }
-            printf("[loader] processed %d RELA relocations (of %d)\n", patched, num_rela);
-        }
-
-        break;
-    }
-
+    g_modules.push_back({"eboot.bin", load_base, highest_end - lowest_vaddr, 0, 0});
+    DynInfo di = ReadDynamic(elf_base, phdrs, ehdr->e_phnum);
+    size_t bound = LinkImage(di, reloc_offset, g_modules.size(), g_modules.back());
+    printf("[loader] patched %zu GOT entries (%zu distinct imports)\n", bound, g_imports.size());
     return true;
 }
 
@@ -486,9 +702,10 @@ static void MainLoop() {
 
     // Run interpreter for a time slice
     if (g_cpu && g_running) {
-        uint64_t before = g_cpu->GetInstructionCount();
-        auto exc = g_cpu->Run(1000000);
-        uint64_t executed = g_cpu->GetInstructionCount() - before;
+        static int quiet_frames = 0;
+        const int calls_before = g_hle_call_count;
+        uint64_t executed = 0;
+        auto exc = KytyWeb::HleRunThreads(1000000, &executed);
         g_total_insn += executed;
 
         static int diag_frames = 0;
@@ -499,6 +716,8 @@ static void MainLoop() {
         }
         if (diag_frames == 5 || diag_frames % 120 == 0) LogTopImports();
         diag_frames++;
+        quiet_frames = g_hle_call_count == calls_before ? quiet_frames + 1 : 0;
+        if (quiet_frames == 3) DumpStall();
 
         if (KytyWeb::HleHaltRequested()) {
             printf("[cpu] halted at RIP=0x%llx after %llu instructions\n",
@@ -513,9 +732,23 @@ static void MainLoop() {
                    g_cpu->ReadMemory8(rip), g_cpu->ReadMemory8(rip + 1));
             LogTopImports();
             g_running = false;
+        } else if (exc == KytyWeb::X86Exception::PageFault) {
+            uint64_t rip = g_cpu->FaultRip();
+            uint8_t bytes[8] = {};
+            if (rip >= EMU_BASE_ADDR && rip + 8 <= EMU_BASE_ADDR + EMU_MEM_SIZE)
+                memcpy(bytes, g_emu_memory + (rip - EMU_BASE_ADDR), 8);
+            printf("[cpu] page fault: access to unmapped address 0x%llx by the instruction at RIP=0x%llx "
+                   "(%02x %02x %02x %02x %02x %02x), halting\n",
+                   (unsigned long long)g_cpu->FaultAddress(), (unsigned long long)rip,
+                   bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]);
+            DumpStall();
+            LogTopImports();
+            g_running = false;
         } else if (exc == KytyWeb::X86Exception::GeneralProtection) {
             printf("[cpu] RIP out of range (0x%llx), halting interpreter\n",
                    (unsigned long long)g_cpu->Regs().rip);
+            DumpStall();
+            LogTopImports();
             g_running = false;
         } else if (exc == KytyWeb::X86Exception::Syscall) {
             // Syscall handled, continue execution
@@ -670,9 +903,9 @@ int kyty_load_game(const char* game_path) {
     stack_top -= 8; w64(stack_top, argv_str);   // argv[0]
     stack_top -= 8; w64(stack_top, 1);          // argc
 
+    // _start(args, cleanup) runs the static constructors itself (DT_INIT) before main.
     g_cpu->SetStackPointer(stack_top);
     g_cpu->SetInstructionPointer(g_main_module.entry_point);
-    // RDI = pointer to argc block (same format as stack), RSI = 0 (no cleanup)
     g_cpu->Regs().rdi = setup_base;
     g_cpu->Regs().rsi = 0;
     g_cpu->SetTraceEnabled(false);
@@ -693,6 +926,11 @@ int kyty_load_game(const char* game_path) {
 
     printf("[kytyps5] game loaded and running\n");
     return 0;
+}
+
+// Debug aid: log when execution reaches a runtime address. Call after kyty_init.
+void kyty_watch(uint32_t addr) {
+    if (g_cpu) g_cpu->AddWatch(addr);
 }
 
 void kyty_frame() {

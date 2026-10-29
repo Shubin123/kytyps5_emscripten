@@ -16,7 +16,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
+#include <functional>
 #include <map>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -250,7 +253,6 @@ int64_t AllocDirect(uint64_t search_start, uint64_t search_end, uint64_t len, ui
 // --- misc state ---
 
 uint64_t g_thread_handle = 0, g_ctype = 0, g_tolower = 0, g_toupper = 0, g_tm = 0;
-std::unordered_map<uint32_t, uint64_t> g_tls_values;
 uint32_t g_next_key = 1;
 uint64_t g_strtok_next = 0;
 const auto g_start = std::chrono::steady_clock::now();
@@ -862,23 +864,10 @@ void KernelIsStack(X86Regs& r) {
     r.rax = 0;
 }
 
-// threads and synchronization (single-threaded)
 void RetZero(X86Regs& r) { r.rax = 0; }
-void ThreadSelf(X86Regs& r) { r.rax = g_thread_handle; }
 void ThreadEqual(X86Regs& r) { r.rax = r.rdi == r.rsi; }
 void WriteNewHandle(X86Regs& r) { Wr<uint64_t>(r.rdi, NewHandle()); r.rax = 0; }
 void KeyCreate(X86Regs& r) { Wr<uint32_t>(r.rdi, g_next_key++); r.rax = 0; }
-void GetSpecific(X86Regs& r) { auto it = g_tls_values.find((uint32_t)r.rdi); r.rax = it == g_tls_values.end() ? 0 : it->second; }
-void SetSpecific(X86Regs& r) { g_tls_values[(uint32_t)r.rdi] = r.rsi; r.rax = 0; }
-void LogThread(uint64_t entry, const std::string& name) {
-    printf("[hle] thread %s (entry 0x%llx) not started: threads are not emulated yet\n",
-           name.empty() ? "<unnamed>" : name.c_str(), (unsigned long long)entry);
-}
-void PthreadCreate(X86Regs& r) { LogThread(r.rdx, ""); Wr<uint64_t>(r.rdi, NewHandle()); r.rax = 0; }
-void ScePthreadCreate(X86Regs& r) { LogThread(r.rdx, Str(r.r8, 64)); Wr<uint64_t>(r.rdi, NewHandle()); r.rax = 0; }
-void ThreadJoin(X86Regs& r) { if (r.rsi) Wr<uint64_t>(r.rsi, 0); r.rax = 0; }
-void WaitEventFlag(X86Regs& r) { if (r.rcx) Wr<uint64_t>(r.rcx, r.rsi); r.rax = 0; }
-void WaitEqueue(X86Regs& r) { if (r.rcx) Wr<int32_t>(r.rcx, 0); Ret(r, r.r8 ? kSceErrEtimedout : 0); }
 
 // system services
 void UserServiceGetInitialUser(X86Regs& r) { Wr<int32_t>(r.rdi, 1); r.rax = 0; }
@@ -901,11 +890,6 @@ void SystemServiceGetDisplaySafeAreaInfo(X86Regs& r) { Wr<float>(r.rdi, 1.0f); r
 void AppParamGetInt(X86Regs& r) { Wr<int32_t>(r.rsi, 0); r.rax = 0; }
 void NpGetAccountId(X86Regs& r) { Wr<uint64_t>(r.rsi, 1); r.rax = 0; }
 void ReturnHandle1(X86Regs& r) { r.rax = 1; }
-void LoadStartModule(X86Regs& r) {
-    static int next = 0x10;
-    printf("[hle] load module %s (not loaded; HLE only)\n", Str(r.rdi, 256).c_str());
-    r.rax = next++;
-}
 void Dlsym(X86Regs& r) {
     printf("[hle] dlsym %s: unresolved\n", Str(r.rsi, 256).c_str());
     Ret(r, kSceErrEnoent);
@@ -913,6 +897,499 @@ void Dlsym(X86Regs& r) {
 void VideoOutOpen(X86Regs& r) {
     printf("[hle] sceVideoOutOpen(user=%d, bus=%d)\n", (int)r.rdi, (int)r.rsi);
     r.rax = 1;
+}
+
+// C++ runtime
+void PosixMemalign(X86Regs& r) {
+    uint64_t a = g_heap.Alloc(r.rdx, r.rsi);
+    if (!a) { r.rax = 12; return; }
+    Wr<uint64_t>(r.rdi, a);
+    r.rax = 0;
+}
+void AlignedNew(X86Regs& r) { r.rax = g_heap.Alloc(r.rdi, r.rsi); }  // operator new(size, align)
+void Terminate(X86Regs&) { Halt("std::terminate called"); }
+void LengthError(X86Regs& r) { Halt(("std::length_error: " + Str(r.rdi, 200)).c_str()); }
+void CxaThrow(X86Regs& r) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "C++ exception thrown (type_info 0x%llx); exceptions are not supported yet",
+             (unsigned long long)r.rsi);
+    Halt(buf);
+}
+void CxaRethrow(X86Regs&) { Halt("C++ exception rethrown; exceptions are not supported yet"); }
+void CxaBeginCatch(X86Regs& r) { r.rax = r.rdi; }
+
+// libc: sorting with guest comparators
+void Qsort(X86Regs& r) {
+    const uint64_t base = r.rdi, n = r.rsi, size = r.rdx, cmp = r.rcx;
+    if (n < 2 || !size || !Ptr(base, n * size)) return;
+    std::vector<uint8_t> copy(Ptr(base, n * size), Ptr(base, n * size) + n * size);
+    const uint64_t scratch = g_heap.Alloc(2 * size, 16);
+    std::vector<uint64_t> idx(n);
+    for (uint64_t i = 0; i < n; i++) idx[i] = i;
+    std::stable_sort(idx.begin(), idx.end(), [&](uint64_t a, uint64_t b) {
+        memcpy(Ptr(scratch, size), copy.data() + a * size, size);
+        memcpy(Ptr(scratch + size, size), copy.data() + b * size, size);
+        return (int32_t)L.call_guest(cmp, scratch, scratch + size, 0) < 0;
+    });
+    for (uint64_t i = 0; i < n; i++) memcpy(Ptr(base + i * size, size), copy.data() + idx[i] * size, size);
+    g_heap.Free(scratch);
+}
+void Bsearch(X86Regs& r) {
+    const uint64_t key = r.rdi, base = r.rsi, size = r.rcx, cmp = r.r8;
+    uint64_t lo = 0, hi = r.rdx;
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2;
+        int32_t c = (int32_t)L.call_guest(cmp, key, base + mid * size, 0);
+        if (c == 0) { r.rax = base + mid * size; return; }
+        if (c < 0) hi = mid; else lo = mid + 1;
+    }
+    r.rax = 0;
+}
+
+// libc: time formatting
+struct tm GuestTm(uint64_t a) {
+    struct tm t{};
+    int32_t f[9] = {};
+    if (auto* p = Ptr(a, sizeof(f))) memcpy(f, p, sizeof(f));
+    t.tm_sec = f[0]; t.tm_min = f[1]; t.tm_hour = f[2]; t.tm_mday = f[3]; t.tm_mon = f[4];
+    t.tm_year = f[5]; t.tm_wday = f[6]; t.tm_yday = f[7]; t.tm_isdst = f[8];
+    return t;
+}
+void Strftime(X86Regs& r) {
+    struct tm t = GuestTm(r.rcx);
+    std::string fmt = Str(r.rdx, 256);
+    std::vector<char> out(std::max<uint64_t>(r.rsi, 1));
+    size_t n = strftime(out.data(), out.size(), fmt.c_str(), &t);
+    if (n && Ptr(r.rdi, n + 1)) memcpy(Ptr(r.rdi, n + 1), out.data(), n + 1);
+    r.rax = n;
+}
+void Mktime(X86Regs& r) { struct tm t = GuestTm(r.rdi); Ret(r, (int64_t)mktime(&t)); }
+void Difftime(X86Regs& r) { RetD(r, (double)((int64_t)r.rdi - (int64_t)r.rsi)); }
+void RtcGetCurrentTick(X86Regs& r) {
+    constexpr uint64_t kUsecFromYear1ToEpoch = 62135596800000000ULL;
+    Wr<uint64_t>(r.rdi, (uint64_t)UnixUsec() + kUsecFromYear1ToEpoch);
+    r.rax = 0;
+}
+
+// libc: locale and stdio odds and ends
+uint64_t g_c_locale = 0;
+void Setlocale(X86Regs& r) { r.rax = g_c_locale; }
+void Fgetc(X86Regs& r) {
+    auto it = g_files.find(r.rdi);
+    Ret(r, it != g_files.end() ? fgetc(it->second) : -1);
+}
+
+// POSIX file calls (errno style)
+void PosixStat(X86Regs& r) {
+    std::string path = HostPath(Str(r.rdi));
+    struct stat st{};
+    if (stat(path.c_str(), &st) < 0) { LogOpen(path, -1); SetErrno(errno); Ret(r, -1); return; }
+    WriteStat(r.rsi, st);
+    r.rax = 0;
+}
+void PosixFstat(X86Regs& r) {
+    struct stat st{};
+    if (fstat((int)r.rdi, &st) < 0) { SetErrno(errno); Ret(r, -1); return; }
+    WriteStat(r.rsi, st);
+    r.rax = 0;
+}
+void PosixLseek(X86Regs& r) {
+    off_t o = lseek((int)r.rdi, (off_t)r.rsi, (int)r.rdx);
+    if (o < 0) SetErrno(errno);
+    Ret(r, o);
+}
+void PosixWrite(X86Regs& r) { int64_t n = WriteImpl(r, false); if (n < 0) SetErrno(errno); Ret(r, n); }
+void PosixUnlink(X86Regs& r) {
+    int rc = unlink(HostPath(Str(r.rdi)).c_str());
+    if (rc < 0) SetErrno(errno);
+    Ret(r, rc);
+}
+void PosixRename(X86Regs& r) {
+    int rc = rename(HostPath(Str(r.rdi)).c_str(), HostPath(Str(r.rsi)).c_str());
+    if (rc < 0) SetErrno(errno);
+    Ret(r, rc);
+}
+void Getpid(X86Regs& r) { r.rax = 1000; }
+
+void KernelGetdents(X86Regs& r) { r.rax = 0; }
+
+MATH_D1(Asin, asin) MATH_D1(Atan, atan) MATH_D1(Tanh, tanh) MATH_D1(Log10, log10)
+
+// --- threads ---
+// Guest threads run one at a time in round-robin time slices. A blocking call parks its thread: the
+// interpreter leaves RIP on the import stub, so the call runs again once `ready` holds or the timeout passes.
+
+struct GuestThread {
+    uint64_t handle = 0;
+    std::string name;
+    X86Regs regs{};
+    uint64_t stack_lo = 0, stack_hi = 0, errno_addr = 0;
+    std::unordered_map<uint32_t, uint64_t> specific;
+    std::unordered_map<uint64_t, uint64_t> module_tls;
+    bool blocked = false, finished = false, timed_out = false;
+    std::function<bool()> ready;
+    int64_t deadline_us = -1;
+    const char* waiting_for = "";
+    uint64_t exit_value = 0;
+    // A blocking call that spans several retries
+    uint64_t call_rip = 0;
+    int phase = 0;
+    bool signaled = false;
+    int saved_lock_count = 0;
+};
+std::vector<std::unique_ptr<GuestThread>> g_threads;
+size_t g_cur = 0;
+GuestThread* Cur() { return g_threads[g_cur].get(); }
+GuestThread* ThreadByHandle(uint64_t h) {
+    for (auto& t : g_threads) if (t->handle == h) return t.get();
+    return nullptr;
+}
+
+constexpr int64_t kSceErrEperm = (int32_t)0x80020001, kSceErrEdeadlk = (int32_t)0x8002000B,
+                  kSceErrEbusy = (int32_t)0x80020010, kSceErrEsrch = (int32_t)0x80020003;
+constexpr int kEperm = 1, kEsrch = 3, kEdeadlk = 11, kEbusy = 16, kEagain = 35, kEtimedout = 60;
+
+void Park(const char* what, std::function<bool()> ready, int64_t timeout_us = -1) {
+    GuestThread* t = Cur();
+    t->blocked = true;
+    t->timed_out = false;
+    t->waiting_for = what;
+    t->ready = std::move(ready);
+    t->deadline_us = timeout_us >= 0 ? UsecSinceStart() + timeout_us : -1;
+    L.cpu->RequestYield(true);
+}
+// True the first time a blocking call executes; false when it is being retried after parking.
+bool FirstEntry(const X86Regs& r) {
+    GuestThread* t = Cur();
+    if (t->call_rip == r.rip) return false;
+    t->call_rip = r.rip;
+    t->phase = 0;
+    t->signaled = false;
+    return true;
+}
+void EndCall() { Cur()->call_rip = 0; Cur()->phase = 0; }
+// pthread objects are pointers to an internal object; static initializers leave them NULL.
+uint64_t ObjectOf(uint64_t var) {
+    uint64_t h = Rd<uint64_t>(var);
+    if (!h) { h = NewHandle(); Wr<uint64_t>(var, h); }
+    return h;
+}
+
+// mutexes (FreeBSD/SCE types: 1 errorcheck, 2 recursive, 3 normal, 4 adaptive)
+constexpr int kMutexRecursive = 2;
+struct Mutex { GuestThread* owner = nullptr; int count = 0; int type = 1; };
+std::unordered_map<uint64_t, Mutex> g_mutexes;
+std::unordered_map<uint64_t, int> g_mutex_attr_type;
+
+void MutexInit(X86Regs& r) {
+    uint64_t h = NewHandle();
+    Wr<uint64_t>(r.rdi, h);
+    auto it = g_mutex_attr_type.find(r.rsi ? Rd<uint64_t>(r.rsi) : 0);
+    g_mutexes[h] = Mutex{nullptr, 0, it == g_mutex_attr_type.end() ? 1 : it->second};
+    r.rax = 0;
+}
+void MutexattrSettype(X86Regs& r) { g_mutex_attr_type[ObjectOf(r.rdi)] = (int)r.rsi; r.rax = 0; }
+void MutexDestroy(X86Regs& r) { g_mutexes.erase(Rd<uint64_t>(r.rdi)); r.rax = 0; }
+void MutexLockCommon(X86Regs& r, bool sce, bool try_only) {
+    const uint64_t h = ObjectOf(r.rdi);
+    Mutex& m = g_mutexes[h];
+    GuestThread* t = Cur();
+    if (!m.owner) { m.owner = t; m.count = 1; r.rax = 0; return; }
+    if (m.owner == t) {
+        if (m.type == kMutexRecursive) { m.count++; r.rax = 0; return; }
+        Ret(r, sce ? kSceErrEdeadlk : kEdeadlk);
+        return;
+    }
+    if (try_only) { Ret(r, sce ? kSceErrEbusy : kEbusy); return; }
+    Park("mutex", [h] { return !g_mutexes[h].owner; });
+}
+void MutexLock(X86Regs& r) { MutexLockCommon(r, false, false); }
+void SceMutexLock(X86Regs& r) { MutexLockCommon(r, true, false); }
+void MutexTrylock(X86Regs& r) { MutexLockCommon(r, false, true); }
+void SceMutexTrylock(X86Regs& r) { MutexLockCommon(r, true, true); }
+void MutexUnlockCommon(X86Regs& r, bool sce) {
+    Mutex& m = g_mutexes[ObjectOf(r.rdi)];
+    if (m.owner != Cur()) { Ret(r, sce ? kSceErrEperm : kEperm); return; }
+    if (--m.count == 0) m.owner = nullptr;
+    r.rax = 0;
+}
+void MutexUnlock(X86Regs& r) { MutexUnlockCommon(r, false); }
+void SceMutexUnlock(X86Regs& r) { MutexUnlockCommon(r, true); }
+
+// condition variables
+struct Cond { std::deque<GuestThread*> waiters; };
+std::unordered_map<uint64_t, Cond> g_conds;
+
+void CondWaitCommon(X86Regs& r, int64_t timeout_us, bool sce) {
+    GuestThread* t = Cur();
+    const uint64_t c = ObjectOf(r.rdi), mh = ObjectOf(r.rsi);
+    if (FirstEntry(r)) {  // release the mutex and wait for a signal
+        Mutex& m = g_mutexes[mh];
+        if (m.owner != t) { EndCall(); Ret(r, sce ? kSceErrEperm : kEperm); return; }
+        t->saved_lock_count = m.count;
+        m.owner = nullptr;
+        m.count = 0;
+        g_conds[c].waiters.push_back(t);
+        t->phase = 1;
+        Park("condition variable", [t] { return t->signaled; }, timeout_us);
+        return;
+    }
+    if (t->phase == 1) {  // woken by a signal or the timeout
+        if (!t->signaled) {
+            auto& w = g_conds[c].waiters;
+            w.erase(std::remove(w.begin(), w.end(), t), w.end());
+        }
+        t->phase = t->signaled ? 2 : 3;
+    }
+    Mutex& m = g_mutexes[mh];  // reacquire before returning
+    if (m.owner && m.owner != t) { Park("mutex", [mh] { return !g_mutexes[mh].owner; }); return; }
+    m.owner = t;
+    m.count = t->saved_lock_count;
+    const bool timed_out = t->phase == 3;
+    EndCall();
+    Ret(r, timed_out ? (sce ? kSceErrEtimedout : kEtimedout) : 0);
+}
+void CondWait(X86Regs& r) { CondWaitCommon(r, -1, false); }
+void SceCondWait(X86Regs& r) { CondWaitCommon(r, -1, true); }
+void CondTimedwait(X86Regs& r) {  // absolute CLOCK_REALTIME deadline
+    int64_t us = Rd<int64_t>(r.rdx) * 1000000 + Rd<int64_t>(r.rdx + 8) / 1000 - UnixUsec();
+    CondWaitCommon(r, std::max<int64_t>(us, 0), false);
+}
+void SceCondTimedwait(X86Regs& r) { CondWaitCommon(r, (int64_t)(uint32_t)r.rdx, true); }  // relative microseconds
+void CondSignal(X86Regs& r) {
+    auto& w = g_conds[ObjectOf(r.rdi)].waiters;
+    if (!w.empty()) { w.front()->signaled = true; w.pop_front(); }
+    r.rax = 0;
+}
+void CondBroadcast(X86Regs& r) {
+    auto& w = g_conds[ObjectOf(r.rdi)].waiters;
+    for (GuestThread* t : w) t->signaled = true;
+    w.clear();
+    r.rax = 0;
+}
+void CondInit(X86Regs& r) { uint64_t h = NewHandle(); Wr<uint64_t>(r.rdi, h); g_conds[h]; r.rax = 0; }
+void CondDestroy(X86Regs& r) { g_conds.erase(Rd<uint64_t>(r.rdi)); r.rax = 0; }
+
+// reader/writer locks
+struct RwLock { GuestThread* writer = nullptr; int readers = 0; };
+std::unordered_map<uint64_t, RwLock> g_rwlocks;
+void RwInit(X86Regs& r) { uint64_t h = NewHandle(); Wr<uint64_t>(r.rdi, h); g_rwlocks[h]; r.rax = 0; }
+void RwRdlock(X86Regs& r) {
+    const uint64_t h = ObjectOf(r.rdi);
+    RwLock& l = g_rwlocks[h];
+    if (!l.writer || l.writer == Cur()) { l.readers++; r.rax = 0; return; }
+    Park("rwlock", [h] { return !g_rwlocks[h].writer; });
+}
+void RwWrlock(X86Regs& r) {
+    const uint64_t h = ObjectOf(r.rdi);
+    RwLock& l = g_rwlocks[h];
+    if (!l.writer && !l.readers) { l.writer = Cur(); r.rax = 0; return; }
+    Park("rwlock", [h] { return !g_rwlocks[h].writer && !g_rwlocks[h].readers; });
+}
+void RwUnlock(X86Regs& r) {
+    RwLock& l = g_rwlocks[ObjectOf(r.rdi)];
+    if (l.writer == Cur()) l.writer = nullptr;
+    else if (l.readers) l.readers--;
+    r.rax = 0;
+}
+void RwDestroy(X86Regs& r) { g_rwlocks.erase(Rd<uint64_t>(r.rdi)); r.rax = 0; }
+
+// semaphores: (SceKernelSema* out, name, attr, init, max, opt); wait(sema, need, timeout*)
+struct Sema { int64_t count, max; };
+std::unordered_map<uint64_t, Sema> g_semas;
+void SemaCreate(X86Regs& r) {
+    uint64_t h = NewHandle();
+    Wr<uint64_t>(r.rdi, h);
+    g_semas[h] = {(int32_t)r.rcx, (int32_t)r.r8};
+    r.rax = 0;
+}
+void SemaWait(X86Regs& r) {
+    const uint64_t h = r.rdi;
+    const int64_t need = (int32_t)r.rsi;
+    Sema& s = g_semas[h];
+    if (s.count >= need) { s.count -= need; EndCall(); r.rax = 0; return; }
+    if (!FirstEntry(r) && Cur()->timed_out) { EndCall(); Ret(r, kSceErrEtimedout); return; }
+    Park("semaphore", [h, need] { return g_semas[h].count >= need; }, r.rdx ? (int64_t)Rd<uint32_t>(r.rdx) : -1);
+}
+void SemaPoll(X86Regs& r) {
+    Sema& s = g_semas[r.rdi];
+    const int64_t need = (int32_t)r.rsi;
+    if (s.count < need) { Ret(r, kSceErrEbusy); return; }
+    s.count -= need;
+    r.rax = 0;
+}
+void SemaSignal(X86Regs& r) {
+    Sema& s = g_semas[r.rdi];
+    s.count = std::min(s.max > 0 ? s.max : INT64_MAX, s.count + (int32_t)r.rsi);
+    r.rax = 0;
+}
+void SemaDelete(X86Regs& r) { g_semas.erase(r.rdi); r.rax = 0; }
+
+// event flags: wait mode 0x01 = all bits, 0x02 = any bit; 0x10 = clear all, 0x20 = clear the pattern
+std::unordered_map<uint64_t, uint64_t> g_eventflags;
+bool EventFlagMatches(uint64_t h, uint64_t pattern, uint32_t mode) {
+    uint64_t bits = g_eventflags[h];
+    return (mode & 1) ? (bits & pattern) == pattern : (bits & pattern) != 0;
+}
+bool EventFlagTake(uint64_t h, uint64_t pattern, uint32_t mode, uint64_t result) {
+    if (!EventFlagMatches(h, pattern, mode)) return false;
+    uint64_t& bits = g_eventflags[h];
+    if (result) Wr<uint64_t>(result, bits);
+    if (mode & 0x10) bits = 0;
+    else if (mode & 0x20) bits &= ~pattern;
+    return true;
+}
+void EventFlagCreate(X86Regs& r) {
+    uint64_t h = NewHandle();
+    Wr<uint64_t>(r.rdi, h);
+    g_eventflags[h] = r.rcx;
+    r.rax = 0;
+}
+void EventFlagWait(X86Regs& r) {  // (ef, pattern, mode, result*, timeout*)
+    const uint64_t h = r.rdi, pattern = r.rsi;
+    const uint32_t mode = (uint32_t)r.rdx;
+    if (EventFlagTake(h, pattern, mode, r.rcx)) { EndCall(); r.rax = 0; return; }
+    if (!FirstEntry(r) && Cur()->timed_out) {
+        EndCall();
+        if (r.rcx) Wr<uint64_t>(r.rcx, g_eventflags[h]);
+        Ret(r, kSceErrEtimedout);
+        return;
+    }
+    Park("event flag", [h, pattern, mode] { return EventFlagMatches(h, pattern, mode); },
+         r.r8 ? (int64_t)Rd<uint32_t>(r.r8) : -1);
+}
+void EventFlagPoll(X86Regs& r) { Ret(r, EventFlagTake(r.rdi, r.rsi, (uint32_t)r.rdx, r.rcx) ? 0 : kSceErrEbusy); }
+void EventFlagSet(X86Regs& r) { g_eventflags[r.rdi] |= r.rsi; r.rax = 0; }
+void EventFlagClear(X86Regs& r) { g_eventflags[r.rdi] &= r.rsi; r.rax = 0; }
+void EventFlagDelete(X86Regs& r) { g_eventflags.erase(r.rdi); r.rax = 0; }
+
+// No kernel events are produced yet (no GPU/video emulation): waits time out, or last one vblank.
+void EqueueWait(X86Regs& r) {  // (eq, events*, num, out*, timeout*)
+    if (FirstEntry(r)) {
+        Park("event queue", [] { return false; }, r.r8 ? (int64_t)Rd<uint32_t>(r.r8) : 16667);
+        return;
+    }
+    EndCall();
+    if (r.rcx) Wr<int32_t>(r.rcx, 0);
+    Ret(r, r.r8 ? kSceErrEtimedout : 0);
+}
+
+// sleeping and yielding
+void SleepUs(X86Regs& r, int64_t us) {
+    if (FirstEntry(r)) { Park("sleep", [] { return false; }, std::max<int64_t>(us, 0)); return; }
+    EndCall();
+    r.rax = 0;
+}
+void Usleep(X86Regs& r) { SleepUs(r, (int64_t)(uint32_t)r.rdi); }
+void Nanosleep(X86Regs& r) { SleepUs(r, Rd<int64_t>(r.rdi) * 1000000 + Rd<int64_t>(r.rdi + 8) / 1000); }
+void SleepSec(X86Regs& r) { SleepUs(r, (int64_t)(uint32_t)r.rdi * 1000000); }
+void YieldNow(X86Regs& r) { r.rax = 0; L.cpu->RequestYield(false); }
+
+// thread lifecycle
+uint64_t g_tls_image = 0, g_tls_filesz = 0, g_tls_size = 0, g_tls_align = 16;
+struct ModuleTls { uint64_t image, filesz, memsz, align; };
+std::unordered_map<uint64_t, ModuleTls> g_module_tls;
+std::unordered_map<uint64_t, uint64_t> g_attr_stacksize, g_attr_thread;
+uint64_t g_exit_trap = 0;
+constexpr uint64_t kStaticTlsModule = 1;  // the eboot
+
+void FinishThread(uint64_t value) {
+    GuestThread* t = Cur();
+    t->finished = true;
+    t->exit_value = value;
+    printf("[threads] %s finished\n", t->name.c_str());
+    L.cpu->RequestYield(true);
+}
+void ThreadExit(X86Regs& r) { FinishThread(r.rdi); }
+
+int64_t CreateThread(uint64_t out, uint64_t attr_ptr, uint64_t entry, uint64_t arg, std::string name) {
+    auto t = std::make_unique<GuestThread>();
+    t->handle = NewHandle();
+    t->name = name.empty() ? "thread " + std::to_string(g_threads.size()) : name;
+    const uint64_t attr = attr_ptr ? Rd<uint64_t>(attr_ptr) : 0;
+    auto ss = g_attr_stacksize.find(attr);
+    const uint64_t stack_size = std::clamp<uint64_t>(ss == g_attr_stacksize.end() ? (1 << 20) : ss->second, 64 << 10, 8 << 20);
+    const uint64_t stack = VmAlloc(stack_size, 0x4000, 3, HleRegion::Stack, 0, 0, t->name.c_str());
+    const uint64_t tls = g_heap.Alloc(g_tls_size + 0x100, g_tls_align);
+    if (!stack || !tls) return -1;
+    memset(Ptr(tls, g_tls_size + 0x100), 0, g_tls_size + 0x100);
+    if (g_tls_filesz) memcpy(Ptr(tls, g_tls_filesz), Ptr(g_tls_image, g_tls_filesz), g_tls_filesz);
+    const uint64_t tp = tls + g_tls_size;  // fs:[0] holds the thread pointer itself
+    Wr<uint64_t>(tp, tp);
+    t->stack_lo = stack;
+    t->stack_hi = stack + stack_size;
+    t->errno_addr = g_heap.Alloc(16, 16);
+    t->regs.rflags = 0x202;
+    t->regs.rip = entry;
+    t->regs.rdi = arg;
+    t->regs.rsp = t->stack_hi - 16 - 8;  // entered as if called; returning lands on the exit trap
+    Wr<uint64_t>(t->regs.rsp, g_exit_trap);
+    t->regs.fs_base = tp;
+    Wr<uint64_t>(out, t->handle);
+    printf("[threads] created %s (entry 0x%llx, stack 0x%llx)\n", t->name.c_str(), (unsigned long long)entry,
+           (unsigned long long)stack_size);
+    g_threads.push_back(std::move(t));
+    return 0;
+}
+void PthreadCreate(X86Regs& r) { Ret(r, CreateThread(r.rdi, r.rsi, r.rdx, r.rcx, "") ? kEagain : 0); }
+void ScePthreadCreate(X86Regs& r) { Ret(r, CreateThread(r.rdi, r.rsi, r.rdx, r.rcx, Str(r.r8, 31)) ? kSceErrEagain : 0); }
+void ThreadJoinCommon(X86Regs& r, bool sce) {
+    GuestThread* t = ThreadByHandle(r.rdi);
+    if (!t) { Ret(r, sce ? kSceErrEsrch : kEsrch); return; }
+    if (!t->finished) { Park("thread join", [t] { return t->finished; }); return; }
+    if (r.rsi) Wr<uint64_t>(r.rsi, t->exit_value);
+    r.rax = 0;
+}
+void ThreadJoin(X86Regs& r) { ThreadJoinCommon(r, false); }
+void SceThreadJoin(X86Regs& r) { ThreadJoinCommon(r, true); }
+void ThreadSelf(X86Regs& r) { r.rax = Cur()->handle; }
+void GetSpecific(X86Regs& r) {
+    auto& s = Cur()->specific;
+    auto it = s.find((uint32_t)r.rdi);
+    r.rax = it == s.end() ? 0 : it->second;
+}
+void SetSpecific(X86Regs& r) { Cur()->specific[(uint32_t)r.rdi] = r.rsi; r.rax = 0; }
+void AttrSetStacksize(X86Regs& r) { g_attr_stacksize[ObjectOf(r.rdi)] = r.rsi; r.rax = 0; }
+void AttrGet(X86Regs& r) { g_attr_thread[ObjectOf(r.rsi)] = r.rdi; r.rax = 0; }  // (thread, attr*)
+GuestThread* AttrThread(uint64_t attr_ptr) {
+    auto it = g_attr_thread.find(ObjectOf(attr_ptr));
+    GuestThread* t = it == g_attr_thread.end() ? nullptr : ThreadByHandle(it->second);
+    return t ? t : Cur();
+}
+void AttrGetStackaddr(X86Regs& r) { Wr<uint64_t>(r.rsi, AttrThread(r.rdi)->stack_lo); r.rax = 0; }
+void AttrGetStacksize(X86Regs& r) {
+    GuestThread* t = AttrThread(r.rdi);
+    Wr<uint64_t>(r.rsi, t->stack_hi - t->stack_lo);
+    r.rax = 0;
+}
+
+// Dynamic TLS: one block per (thread, module), created from the module's TLS image on first use.
+void TlsGetAddr(X86Regs& r) {
+    const uint64_t mod = Rd<uint64_t>(r.rdi), off = Rd<uint64_t>(r.rdi + 8);
+    if (mod == kStaticTlsModule) { r.rax = r.fs_base - g_tls_size + off; return; }
+    GuestThread* t = Cur();
+    auto it = t->module_tls.find(mod);
+    if (it == t->module_tls.end()) {
+        auto m = g_module_tls.find(mod);
+        if (m == g_module_tls.end()) {
+            printf("[hle] __tls_get_addr: module %llu has no TLS\n", (unsigned long long)mod);
+            r.rax = 0;
+            return;
+        }
+        const uint64_t block = g_heap.Alloc(m->second.memsz, m->second.align);
+        memset(Ptr(block, m->second.memsz), 0, m->second.memsz);
+        if (m->second.filesz) memcpy(Ptr(block, m->second.filesz), Ptr(m->second.image, m->second.filesz), m->second.filesz);
+        it = t->module_tls.emplace(mod, block).first;
+    }
+    r.rax = it->second + off;
+}
+
+void SwitchTo(size_t i) {
+    if (i == g_cur) return;
+    g_threads[g_cur]->regs = L.cpu->Regs();
+    g_cur = i;
+    L.cpu->Regs() = g_threads[i]->regs;
+    g_errno_addr = g_threads[i]->errno_addr;
 }
 
 struct Impl { const char* name; HleFn fn; };
@@ -936,7 +1413,7 @@ const Impl kImpls[] = {
     {"time", Time}, {"clock", Clock}, {"gettimeofday", Gettimeofday}, {"clock_gettime", ClockGettime},
     {"sceKernelClockGettime", ClockGettime}, {"localtime", Localtime}, {"gmtime", Gmtime},
     {"sceKernelGetProcessTime", KernelGetProcessTime}, {"sceKernelGetProcessTimeCounter", KernelGetProcessTimeCounter},
-    {"sceKernelGetProcessTimeCounterFrequency", KernelGetProcessTimeCounterFrequency}, {"sceKernelUsleep", RetZero},
+    {"sceKernelGetProcessTimeCounterFrequency", KernelGetProcessTimeCounterFrequency},
     {"snprintf", Snprintf}, {"vsnprintf", Vsnprintf}, {"sprintf", Sprintf}, {"printf", Printf}, {"vprintf", Vprintf},
     {"fprintf", Fprintf}, {"vfprintf", Vfprintf}, {"puts", Puts}, {"fopen", Fopen}, {"fclose", Fclose},
     {"fread", Fread}, {"fwrite", Fwrite}, {"fseek", Fseek}, {"ftell", Ftell}, {"fflush", RetZero},
@@ -958,29 +1435,51 @@ const Impl kImpls[] = {
     {"sceKernelIsStack", KernelIsStack},
     {"pthread_self", ThreadSelf}, {"scePthreadSelf", ThreadSelf}, {"pthread_equal", ThreadEqual},
     {"pthread_key_create", KeyCreate}, {"pthread_key_delete", RetZero}, {"pthread_getspecific", GetSpecific},
-    {"pthread_setspecific", SetSpecific},
-    {"pthread_mutex_init", WriteNewHandle}, {"pthread_mutexattr_init", WriteNewHandle},
-    {"pthread_cond_init", WriteNewHandle}, {"scePthreadMutexInit", WriteNewHandle},
-    {"scePthreadMutexattrInit", WriteNewHandle}, {"scePthreadAttrInit", WriteNewHandle},
-    {"sceKernelCreateSema", WriteNewHandle}, {"sceKernelCreateEventFlag", WriteNewHandle},
-    {"sceKernelCreateEqueue", WriteNewHandle},
-    {"pthread_mutex_lock", RetZero}, {"pthread_mutex_unlock", RetZero}, {"pthread_mutex_destroy", RetZero},
-    {"pthread_mutexattr_settype", RetZero}, {"pthread_mutexattr_setprotocol", RetZero},
-    {"pthread_mutexattr_destroy", RetZero}, {"pthread_cond_destroy", RetZero}, {"pthread_cond_broadcast", RetZero},
-    {"pthread_cond_signal", RetZero}, {"pthread_cond_wait", RetZero}, {"pthread_cond_timedwait", RetZero},
-    {"sched_yield", RetZero}, {"scePthreadYield", RetZero}, {"scePthreadMutexLock", RetZero},
-    {"scePthreadMutexUnlock", RetZero}, {"scePthreadMutexTrylock", RetZero}, {"scePthreadMutexDestroy", RetZero},
-    {"scePthreadMutexattrSettype", RetZero}, {"scePthreadMutexattrSetprotocol", RetZero},
-    {"scePthreadMutexattrDestroy", RetZero}, {"scePthreadAttrDestroy", RetZero},
-    {"scePthreadAttrSetdetachstate", RetZero}, {"scePthreadAttrSetschedpolicy", RetZero},
-    {"scePthreadAttrSetschedparam", RetZero}, {"scePthreadAttrSetinheritsched", RetZero},
-    {"scePthreadAttrSetstacksize", RetZero}, {"scePthreadAttrSetaffinity", RetZero},
-    {"scePthreadRename", RetZero}, {"scePthreadSetaffinity", RetZero}, {"scePthreadSetprio", RetZero},
+    {"pthread_setspecific", SetSpecific}, {"scePthreadGetspecific", GetSpecific},
+    {"scePthreadSetspecific", SetSpecific}, {"scePthreadKeyCreate", KeyCreate},
     {"pthread_create", PthreadCreate}, {"scePthreadCreate", ScePthreadCreate},
-    {"pthread_join", ThreadJoin}, {"scePthreadJoin", ThreadJoin},
-    {"sceKernelWaitSema", RetZero}, {"sceKernelSignalSema", RetZero}, {"sceKernelDeleteSema", RetZero},
-    {"sceKernelWaitEventFlag", WaitEventFlag}, {"sceKernelSetEventFlag", RetZero},
-    {"sceKernelDeleteEventFlag", RetZero}, {"sceKernelWaitEqueue", WaitEqueue},
+    {"pthread_join", ThreadJoin}, {"scePthreadJoin", SceThreadJoin}, {"pthread_detach", RetZero},
+    {"scePthreadDetach", RetZero}, {"pthread_exit", ThreadExit}, {"scePthreadExit", ThreadExit},
+    {"sched_yield", YieldNow}, {"scePthreadYield", YieldNow}, {"pthread_yield", YieldNow},
+    {"pthread_attr_init", WriteNewHandle}, {"pthread_attr_destroy", RetZero},
+    {"pthread_attr_setstacksize", AttrSetStacksize}, {"pthread_attr_setdetachstate", RetZero},
+    {"scePthreadAttrInit", WriteNewHandle}, {"scePthreadAttrDestroy", RetZero},
+    {"scePthreadAttrSetstacksize", AttrSetStacksize}, {"scePthreadAttrSetdetachstate", RetZero},
+    {"scePthreadAttrSetschedpolicy", RetZero}, {"scePthreadAttrSetschedparam", RetZero},
+    {"scePthreadAttrSetinheritsched", RetZero}, {"scePthreadAttrSetaffinity", RetZero},
+    {"scePthreadAttrGet", AttrGet}, {"scePthreadAttrGetstackaddr", AttrGetStackaddr},
+    {"scePthreadAttrGetstacksize", AttrGetStacksize},
+    {"scePthreadRename", RetZero}, {"scePthreadSetaffinity", RetZero}, {"scePthreadSetprio", RetZero},
+    {"pthread_mutex_init", MutexInit}, {"scePthreadMutexInit", MutexInit},
+    {"pthread_mutex_lock", MutexLock}, {"pthread_mutex_unlock", MutexUnlock}, {"pthread_mutex_trylock", MutexTrylock},
+    {"pthread_mutex_destroy", MutexDestroy}, {"scePthreadMutexLock", SceMutexLock},
+    {"scePthreadMutexUnlock", SceMutexUnlock}, {"scePthreadMutexTrylock", SceMutexTrylock},
+    {"scePthreadMutexDestroy", MutexDestroy},
+    {"pthread_mutexattr_init", WriteNewHandle}, {"pthread_mutexattr_settype", MutexattrSettype},
+    {"pthread_mutexattr_setprotocol", RetZero}, {"pthread_mutexattr_destroy", RetZero},
+    {"scePthreadMutexattrInit", WriteNewHandle}, {"scePthreadMutexattrSettype", MutexattrSettype},
+    {"scePthreadMutexattrSetprotocol", RetZero}, {"scePthreadMutexattrDestroy", RetZero},
+    {"pthread_cond_init", CondInit}, {"pthread_cond_destroy", CondDestroy}, {"pthread_cond_wait", CondWait},
+    {"pthread_cond_timedwait", CondTimedwait}, {"pthread_cond_signal", CondSignal},
+    {"pthread_cond_broadcast", CondBroadcast}, {"pthread_condattr_init", WriteNewHandle},
+    {"pthread_condattr_destroy", RetZero},
+    {"scePthreadCondInit", CondInit}, {"scePthreadCondDestroy", CondDestroy}, {"scePthreadCondWait", SceCondWait},
+    {"scePthreadCondTimedwait", SceCondTimedwait}, {"scePthreadCondSignal", CondSignal},
+    {"scePthreadCondBroadcast", CondBroadcast}, {"scePthreadCondattrInit", WriteNewHandle},
+    {"scePthreadCondattrDestroy", RetZero},
+    {"pthread_rwlock_init", RwInit}, {"pthread_rwlock_destroy", RwDestroy}, {"pthread_rwlock_rdlock", RwRdlock},
+    {"pthread_rwlock_wrlock", RwWrlock}, {"pthread_rwlock_unlock", RwUnlock},
+    {"scePthreadRwlockInit", RwInit}, {"scePthreadRwlockDestroy", RwDestroy}, {"scePthreadRwlockRdlock", RwRdlock},
+    {"scePthreadRwlockWrlock", RwWrlock}, {"scePthreadRwlockUnlock", RwUnlock},
+    {"sceKernelCreateSema", SemaCreate}, {"sceKernelWaitSema", SemaWait}, {"sceKernelPollSema", SemaPoll},
+    {"sceKernelSignalSema", SemaSignal}, {"sceKernelDeleteSema", SemaDelete},
+    {"sceKernelCreateEventFlag", EventFlagCreate}, {"sceKernelWaitEventFlag", EventFlagWait},
+    {"sceKernelPollEventFlag", EventFlagPoll}, {"sceKernelSetEventFlag", EventFlagSet},
+    {"sceKernelClearEventFlag", EventFlagClear}, {"sceKernelDeleteEventFlag", EventFlagDelete},
+    {"sceKernelCancelEventFlag", RetZero},
+    {"sceKernelCreateEqueue", WriteNewHandle}, {"sceKernelWaitEqueue", EqueueWait},
+    {"usleep", Usleep}, {"sceKernelUsleep", Usleep}, {"nanosleep", Nanosleep}, {"sceKernelNanosleep", Nanosleep},
+    {"sleep", SleepSec}, {"sceKernelSleep", SleepSec}, {"__tls_get_addr", TlsGetAddr},
     {"sceUserServiceInitialize", RetZero}, {"sceUserServiceGetInitialUser", UserServiceGetInitialUser},
     {"sceUserServiceGetLoginUserIdList", UserServiceGetLoginUserIdList},
     {"sceUserServiceGetUserName", UserServiceGetUserName}, {"sceUserServiceGetEvent", UserServiceGetEvent},
@@ -991,8 +1490,23 @@ const Impl kImpls[] = {
     {"sceSysmoduleLoadModule", RetZero}, {"sceSysmoduleIsLoaded", RetZero}, {"sceSysmoduleUnloadModule", RetZero},
     {"sceAppContentInitialize", RetZero}, {"sceAppContentAppParamGetInt", AppParamGetInt},
     {"sceNpGetAccountIdA", NpGetAccountId},
-    {"sceKernelLoadStartModule", LoadStartModule}, {"sceKernelDlsym", Dlsym},
+    {"sceKernelDlsym", Dlsym},
     {"sceVideoOutOpen", VideoOutOpen}, {"scePadOpen", ReturnHandle1}, {"sceAudioOutOpen", ReturnHandle1},
+    {"_Znwm", Malloc}, {"_Znam", Malloc}, {"_ZnwmRKSt9nothrow_t", Malloc}, {"_ZnamRKSt9nothrow_t", Malloc},
+    {"_ZdlPv", Free}, {"_ZdaPv", Free}, {"_ZdlPvm", Free}, {"_ZdaPvm", Free},
+    {"_ZnwmSt11align_val_t", AlignedNew}, {"_ZnamSt11align_val_t", AlignedNew},
+    {"_ZdlPvSt11align_val_t", Free}, {"_ZdlPvmSt11align_val_t", Free}, {"_ZdaPvSt11align_val_t", Free},
+    {"posix_memalign", PosixMemalign}, {"_ZSt9terminatev", Terminate}, {"_ZSt14_Xlength_errorPKc", LengthError},
+    {"__cxa_guard_abort", RetZero}, {"__cxa_finalize", RetZero}, {"__cxa_allocate_exception", Malloc},
+    {"__cxa_free_exception", Free}, {"__cxa_throw", CxaThrow}, {"__cxa_rethrow", CxaRethrow},
+    {"__cxa_begin_catch", CxaBeginCatch}, {"__cxa_end_catch", RetZero},
+    {"qsort", Qsort}, {"bsearch", Bsearch}, {"strftime", Strftime}, {"mktime", Mktime}, {"difftime", Difftime},
+    {"sceRtcGetCurrentTick", RtcGetCurrentTick}, {"sceKernelGettimeofday", Gettimeofday},
+    {"setlocale", Setlocale}, {"setvbuf", RetZero}, {"fgetc", Fgetc},
+    {"stat", PosixStat}, {"fstat", PosixFstat}, {"lseek", PosixLseek}, {"write", PosixWrite},
+    {"unlink", PosixUnlink}, {"rename", PosixRename}, {"fcntl", RetZero}, {"getpid", Getpid},
+    {"asin", Asin}, {"atan", Atan}, {"tanh", Tanh}, {"log10", Log10},
+    {"sceKernelGetdents", KernelGetdents},
 };
 
 std::unordered_map<std::string, HleFn> g_by_nid;
@@ -1009,7 +1523,21 @@ void HleInit(const HleLayout& layout) {
     AddRegion(layout.stack_start, layout.stack_end - layout.stack_start, 3, HleRegion::Stack, 0, 0, "main stack");
 
     g_errno_addr = g_heap.Alloc(16, 16);
+    g_c_locale = g_heap.Alloc(16, 16);
+    PutStr(g_c_locale, 2, "C");
     g_thread_handle = NewHandle();
+    g_threads.clear();
+    auto main_thread = std::make_unique<GuestThread>();
+    main_thread->handle = g_thread_handle;
+    main_thread->name = "main";
+    main_thread->stack_lo = layout.stack_start;
+    main_thread->stack_hi = layout.stack_end;
+    main_thread->errno_addr = g_errno_addr;
+    g_threads.push_back(std::move(main_thread));
+    g_cur = 0;
+    g_exit_trap = g_heap.Alloc(16, 16);
+    Wr<uint8_t>(g_exit_trap, 0xC3);
+    L.cpu->RegisterHLEFunction(g_exit_trap, [](X86Regs& r, uint64_t) { FinishThread(r.rax); });
     g_tm = g_heap.Alloc(64, 16);
     g_ctype = g_heap.Alloc(257 * 2, 16);
     g_tolower = g_heap.Alloc(257 * 2, 16);
@@ -1063,5 +1591,62 @@ const char* HleName(const std::string& nid) {
 }
 
 bool HleHaltRequested() { return g_halt; }
+
+void HleSetStaticTls(uint64_t image, uint64_t filesz, uint64_t size, uint64_t align) {
+    g_tls_image = image;
+    g_tls_filesz = filesz;
+    g_tls_size = size;
+    g_tls_align = align;
+}
+
+void HleRegisterModuleTls(uint64_t module_id, uint64_t image, uint64_t filesz, uint64_t memsz, uint64_t align) {
+    g_module_tls[module_id] = {image, filesz, memsz, align};
+}
+
+X86Exception HleRunThreads(uint64_t budget, uint64_t* executed) {
+    constexpr uint64_t kQuantum = 20000;
+    static bool reported_all_blocked = false;
+    uint64_t done = 0;
+    while (done < budget && !g_halt) {
+        const int64_t now = UsecSinceStart();
+        bool sleeping = false;
+        for (auto& t : g_threads) {
+            if (!t->blocked || t->finished) continue;
+            if (t->ready && t->ready()) {
+                t->blocked = false;
+            } else if (t->deadline_us >= 0) {
+                if (now >= t->deadline_us) { t->blocked = false; t->timed_out = true; }
+                else sleeping = true;
+            }
+        }
+        const size_t n = g_threads.size();
+        size_t pick = SIZE_MAX;
+        for (size_t k = 1; k <= n && pick == SIZE_MAX; k++) {
+            size_t i = (g_cur + k) % n;
+            if (!g_threads[i]->blocked && !g_threads[i]->finished) pick = i;
+        }
+        if (pick == SIZE_MAX) {
+            if (!sleeping && !reported_all_blocked) {
+                std::string who;
+                for (auto& t : g_threads)
+                    if (!t->finished) who += " " + t->name + " (" + t->waiting_for + ")";
+                printf("[threads] every thread is blocked:%s\n", who.c_str());
+                reported_all_blocked = true;
+            }
+            break;
+        }
+        reported_all_blocked = false;
+        SwitchTo(pick);
+        const uint64_t before = L.cpu->GetInstructionCount();
+        const X86Exception ex = L.cpu->Run(std::min(kQuantum, budget - done));
+        done += L.cpu->GetInstructionCount() - before;
+        if (ex != X86Exception::None && ex != X86Exception::Yield) {
+            *executed = done;
+            return ex;
+        }
+    }
+    *executed = done;
+    return X86Exception::None;
+}
 
 } // namespace KytyWeb

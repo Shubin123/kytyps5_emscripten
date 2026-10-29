@@ -48,7 +48,7 @@ set(LINK_FLAGS
   "-sMAXIMUM_MEMORY=2147483648"
   "-sSTACK_SIZE=4194304"
   "-sFORCE_FILESYSTEM=1"
-  "-sEXPORTED_FUNCTIONS=['_main','_kyty_init','_kyty_load_game','_kyty_frame','_kyty_input','_kyty_input_values','_kyty_audio_callback','_kyty_get_screen_width','_kyty_get_screen_height','_malloc','_free']"
+  "-sEXPORTED_FUNCTIONS=['_main','_kyty_init','_kyty_load_game','_kyty_frame','_kyty_input','_kyty_input_values','_kyty_audio_callback','_kyty_get_screen_width','_kyty_get_screen_height','_kyty_watch','_malloc','_free']"
   "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','MEMFS','setValue','getValue','UTF8ToString','stringToUTF8','addFunction']"
   "-sENVIRONMENT=web,worker"
   "-sMODULARIZE=1"

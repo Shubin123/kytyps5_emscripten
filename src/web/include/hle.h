@@ -11,6 +11,8 @@ namespace KytyWeb {
 // Address ranges inside the emulated window that SDK implementations allocate from.
 struct HleLayout {
     X86Interpreter* cpu;
+    // Runs guest code fn(a0, a1, a2) to completion (e.g. qsort comparators) and returns rax.
+    uint64_t (*call_guest)(uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2);
     uint8_t* mem;
     uint64_t base, size;
     uint64_t heap_start, heap_end;
@@ -32,6 +34,12 @@ HleFn HleFind(const std::string& nid);
 const char* HleName(const std::string& nid);
 // Set when the game calls exit/abort or fails a stack check.
 bool HleHaltRequested();
+
+// Guest threads run cooperatively in time slices. Returns the first fatal exception, or None.
+X86Exception HleRunThreads(uint64_t budget, uint64_t* executed);
+// TLS images new threads are given: the eboot's static block (below fs:0) and each module's dynamic block.
+void HleSetStaticTls(uint64_t image, uint64_t filesz, uint64_t size, uint64_t align);
+void HleRegisterModuleTls(uint64_t module_id, uint64_t image, uint64_t filesz, uint64_t memsz, uint64_t align);
 
 } // namespace KytyWeb
 

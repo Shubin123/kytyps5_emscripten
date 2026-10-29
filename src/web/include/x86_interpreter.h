@@ -44,7 +44,8 @@ enum class X86Exception {
     GeneralProtection,
     PageFault,
     Syscall,
-    HLECall
+    HLECall,
+    Yield  // the current thread gave up its time slice (blocked, slept, or yielded)
 };
 
 using HLEHandler = std::function<void(X86Regs&, uint64_t func_id)>;
@@ -87,6 +88,18 @@ public:
     uint64_t GetInstructionCount() const { return insn_count_; }
 
     void SetTraceEnabled(bool enable) { trace_enabled_ = enable; }
+    // Logs the first hits on an address (with the return address at [rsp]), for debugging.
+    void AddWatch(uint64_t addr) { watch_[addr] = 0; }
+
+    // From an HLE handler: end the time slice. With retry, the call's RET is not executed, so RIP stays
+    // on the import stub and the same call runs again when the thread is next scheduled.
+    void RequestYield(bool retry) { yield_ = true; yield_retry_ = retry; }
+
+    // After Step() returns PageFault: the unmapped address and the faulting instruction.
+    uint64_t FaultAddress() const { return fault_addr_; }
+    uint64_t FaultRip() const { return fault_rip_; }
+    // True if [addr, addr + n) is mapped; otherwise records a page fault.
+    bool Mapped(uint64_t addr, uint64_t n) const;
     void SetTraceLimit(int limit) { trace_limit_ = limit; }
 
 private:
@@ -122,6 +135,11 @@ private:
     int trace_limit_ = 200;
     int trace_count_ = 0;
     std::unordered_map<uint64_t, HLEHandler> hle_handlers_;
+    std::unordered_map<uint64_t, int> watch_;
+    bool yield_ = false, yield_retry_ = false;
+    mutable bool fault_ = false;
+    mutable uint64_t fault_addr_ = 0;
+    uint64_t fault_rip_ = 0;
     HLEHandler syscall_handler_;
 };
 

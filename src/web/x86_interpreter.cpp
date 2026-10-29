@@ -29,6 +29,46 @@ static inline uint64_t truncate(uint64_t val, int bits) {
     return val & ((1ULL << bits) - 1);
 }
 
+// x86 float->int conversions return the "integer indefinite" value for NaN/out-of-range inputs
+// (a C++ cast is undefined there, and traps or saturates in WebAssembly).
+static int32_t CvtToI32(double v, bool trunc) {
+    v = trunc ? std::trunc(v) : std::nearbyint(v);
+    return (v >= -2147483648.0 && v <= 2147483647.0) ? (int32_t)v : INT32_MIN;
+}
+static int64_t CvtToI64(double v, bool trunc) {
+    v = trunc ? std::trunc(v) : std::nearbyint(v);
+    return (v >= -9223372036854775808.0 && v < 9223372036854775808.0) ? (int64_t)v : INT64_MIN;
+}
+
+static float HalfToFloat(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16, exp = (h >> 10) & 0x1F, mant = h & 0x3FF;
+    if (exp == 0) {
+        float f = (float)mant * (1.0f / 16777216.0f);
+        return sign ? -f : f;
+    }
+    uint32_t bits = exp == 31 ? (sign | 0x7F800000 | (mant << 13)) : (sign | ((exp + 112) << 23) | (mant << 13));
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
+static uint16_t FloatToHalf(float f) {  // round to nearest even
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    uint16_t sign = (x >> 16) & 0x8000;
+    uint32_t a = x & 0x7FFFFFFF;
+    if (a >= 0x7F800000) return sign | 0x7C00 | (a > 0x7F800000 ? 0x200 : 0);
+    if (a >= 0x477FF000) return sign | 0x7C00;
+    if (a < 0x38800000) {
+        float af;
+        memcpy(&af, &a, 4);
+        return sign | (uint16_t)std::nearbyint(af * 16777216.0f);
+    }
+    uint32_t h = (((a >> 23) - 112) << 10) | ((a & 0x7FFFFF) >> 13), rem = a & 0x1FFF;
+    if (rem > 0x1000 || (rem == 0x1000 && (h & 1))) h++;
+    return sign | (uint16_t)h;
+}
+
 X86Interpreter::X86Interpreter() : mem_base_(nullptr), mem_size_(0), mem_base_addr_(0), running_(false), insn_count_(0) {
     init_parity();
     Reset();
@@ -60,62 +100,46 @@ void X86Interpreter::RegisterSyscallHandler(HLEHandler handler) {
     syscall_handler_ = std::move(handler);
 }
 
+// Out-of-range accesses read as 0 and drop writes, but are recorded so Step() reports a page fault
+// (on hardware they would crash; silently continuing hides the real failure).
+bool X86Interpreter::Mapped(uint64_t addr, uint64_t n) const {
+    if (addr >= mem_base_addr_ && n <= mem_size_ && addr - mem_base_addr_ <= mem_size_ - n) return true;
+    if (!fault_) { fault_ = true; fault_addr_ = addr; }
+    return false;
+}
+
+template <class T> static T LoadLE(const uint8_t* p) { T v; memcpy(&v, p, sizeof(T)); return v; }
+
 uint8_t X86Interpreter::ReadMemory8(uint64_t addr) const {
-    if (addr < mem_base_addr_) return 0;
-    uint64_t off = addr - mem_base_addr_;
-    if (off < mem_size_) return mem_base_[off];
-    return 0;
+    return Mapped(addr, 1) ? mem_base_[addr - mem_base_addr_] : 0;
 }
 
 uint16_t X86Interpreter::ReadMemory16(uint64_t addr) const {
-    if (addr < mem_base_addr_) return 0;
-    uint64_t off = addr - mem_base_addr_;
-    if (off + 2 > mem_size_) return 0;
-    uint16_t v;
-    memcpy(&v, mem_base_ + off, 2);
-    return v;
+    return Mapped(addr, 2) ? LoadLE<uint16_t>(mem_base_ + (addr - mem_base_addr_)) : 0;
 }
 
 uint32_t X86Interpreter::ReadMemory32(uint64_t addr) const {
-    if (addr < mem_base_addr_) return 0;
-    uint64_t off = addr - mem_base_addr_;
-    if (off + 4 > mem_size_) return 0;
-    uint32_t v;
-    memcpy(&v, mem_base_ + off, 4);
-    return v;
+    return Mapped(addr, 4) ? LoadLE<uint32_t>(mem_base_ + (addr - mem_base_addr_)) : 0;
 }
 
 uint64_t X86Interpreter::ReadMemory64(uint64_t addr) const {
-    if (addr < mem_base_addr_) return 0;
-    uint64_t off = addr - mem_base_addr_;
-    if (off + 8 > mem_size_) return 0;
-    uint64_t v;
-    memcpy(&v, mem_base_ + off, 8);
-    return v;
+    return Mapped(addr, 8) ? LoadLE<uint64_t>(mem_base_ + (addr - mem_base_addr_)) : 0;
 }
 
 void X86Interpreter::WriteMemory8(uint64_t addr, uint8_t val) {
-    if (addr < mem_base_addr_) return;
-    uint64_t off = addr - mem_base_addr_;
-    if (off < mem_size_) mem_base_[off] = val;
+    if (Mapped(addr, 1)) mem_base_[addr - mem_base_addr_] = val;
 }
 
 void X86Interpreter::WriteMemory16(uint64_t addr, uint16_t val) {
-    if (addr < mem_base_addr_) return;
-    uint64_t off = addr - mem_base_addr_;
-    if (off + 2 <= mem_size_) memcpy(mem_base_ + off, &val, 2);
+    if (Mapped(addr, 2)) memcpy(mem_base_ + (addr - mem_base_addr_), &val, 2);
 }
 
 void X86Interpreter::WriteMemory32(uint64_t addr, uint32_t val) {
-    if (addr < mem_base_addr_) return;
-    uint64_t off = addr - mem_base_addr_;
-    if (off + 4 <= mem_size_) memcpy(mem_base_ + off, &val, 4);
+    if (Mapped(addr, 4)) memcpy(mem_base_ + (addr - mem_base_addr_), &val, 4);
 }
 
 void X86Interpreter::WriteMemory64(uint64_t addr, uint64_t val) {
-    if (addr < mem_base_addr_) return;
-    uint64_t off = addr - mem_base_addr_;
-    if (off + 8 <= mem_size_) memcpy(mem_base_ + off, &val, 8);
+    if (Mapped(addr, 8)) memcpy(mem_base_ + (addr - mem_base_addr_), &val, 8);
 }
 
 void X86Interpreter::Push64(uint64_t val) {
@@ -269,17 +293,43 @@ X86Exception X86Interpreter::Step() {
         trace_count_++;
     }
 
+    if (!watch_.empty()) {
+        auto w = watch_.find(regs_.rip);
+        if (w != watch_.end() && w->second++ < 8) {
+            printf("[watch] hit 0x%llx at instruction %llu, [rsp]=0x%llx rax=0x%llx rcx=0x%llx rdx=0x%llx "
+                   "rsi=0x%llx rdi=0x%llx [rdi]=",
+                   (unsigned long long)regs_.rip, (unsigned long long)insn_count_,
+                   (unsigned long long)ReadMemory64(regs_.rsp), (unsigned long long)regs_.rax,
+                   (unsigned long long)regs_.rcx, (unsigned long long)regs_.rdx, (unsigned long long)regs_.rsi,
+                   (unsigned long long)regs_.rdi);
+            for (int i = 0; i < 4; i++) {
+                uint64_t a = regs_.rdi + 8 * i;
+                bool ok = a >= mem_base_addr_ && a - mem_base_addr_ + 8 <= mem_size_;
+                printf(" %llx", ok ? (unsigned long long)LoadLE<uint64_t>(mem_base_ + (a - mem_base_addr_)) : 0ULL);
+            }
+            printf("\n");
+        }
+    }
+    const uint64_t start_rip = regs_.rip;
     auto it = hle_handlers_.find(regs_.rip);
     if (it != hle_handlers_.end()) {
         it->second(regs_, regs_.rip);
         insn_count_++;
+        if (yield_ && yield_retry_) {
+            yield_ = yield_retry_ = false;
+            return fault_ ? (fault_rip_ = start_rip, X86Exception::PageFault) : X86Exception::Yield;
+        }
         DecodeAndExecute();
         insn_count_++;
+        if (fault_) { fault_rip_ = start_rip; return X86Exception::PageFault; }
+        if (yield_) { yield_ = false; return X86Exception::Yield; }
         return X86Exception::HLECall;
     }
 
     X86Exception ex = DecodeAndExecute();
     insn_count_++;
+    if (fault_) { fault_rip_ = start_rip; return X86Exception::PageFault; }
+    if (yield_ && ex == X86Exception::None) { yield_ = false; return X86Exception::Yield; }
     return ex;
 }
 
@@ -432,7 +482,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
             } else {
                 ea = RegByIndex(base);
             }
-            if (((sib >> 3) & 7) != 4) {
+            if (index != 4) {  // 100b means "no index" only without REX.X; with it, it's r12
                 ea += RegByIndex(index) << scale;
             }
         } else if (rm_raw == 5 && mod == 0) {
@@ -1066,8 +1116,10 @@ X86Exception X86Interpreter::DecodeAndExecute() {
             uint64_t tmp = regs_.rax;
             regs_.rax = regs_.r8;
             regs_.r8 = tmp;
+        } else if (has_rep) {
+            yield_ = true;  // PAUSE: the thread is spin-waiting, so let another thread run
+            yield_retry_ = false;
         }
-        // else NOP
         break;
     }
 
@@ -1838,7 +1890,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 memcpy(regs_.xmm[reg], regs_.xmm[(int)rm_addr], 16);
             } else {
                 uint64_t off = rm_addr - mem_base_addr_;
-                if (off + 16 <= mem_size_) memcpy(regs_.xmm[reg], mem_base_ + off, 16);
+                if (Mapped(rm_addr, 16)) memcpy(regs_.xmm[reg], mem_base_ + off, 16);
             }
             break;
         }
@@ -1853,7 +1905,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 memcpy(regs_.xmm[(int)rm_addr], regs_.xmm[reg], 16);
             } else {
                 uint64_t off = rm_addr - mem_base_addr_;
-                if (off + 16 <= mem_size_) memcpy(mem_base_ + off, regs_.xmm[reg], 16);
+                if (Mapped(rm_addr, 16)) memcpy(mem_base_ + off, regs_.xmm[reg], 16);
             }
             break;
         }
@@ -1873,7 +1925,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
             uint64_t rm_addr; bool rm_is_reg;
             decode_rm(modrm, &rm_addr, &rm_is_reg);
             if (rm_is_reg) memcpy(regs_.xmm[reg], regs_.xmm[(int)rm_addr], 16);
-            else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(regs_.xmm[reg], mem_base_ + off, 16); }
+            else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(regs_.xmm[reg], mem_base_ + off, 16); }
             break;
         }
 
@@ -1884,7 +1936,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
             uint64_t rm_addr; bool rm_is_reg;
             decode_rm(modrm, &rm_addr, &rm_is_reg);
             if (rm_is_reg) memcpy(regs_.xmm[(int)rm_addr], regs_.xmm[reg], 16);
-            else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(mem_base_ + off, regs_.xmm[reg], 16); }
+            else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(mem_base_ + off, regs_.xmm[reg], 16); }
             break;
         }
 
@@ -1931,7 +1983,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
             decode_rm(modrm, &rm_addr, &rm_is_reg);
             uint8_t src[16];
             if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr], 16);
-            else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+            else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
             for (int i = 0; i < 16; i++) regs_.xmm[reg][i] ^= src[i];
             break;
         }
@@ -1943,7 +1995,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
             uint64_t rm_addr; bool rm_is_reg;
             decode_rm(modrm, &rm_addr, &rm_is_reg);
             if (rm_is_reg) memcpy(regs_.xmm[reg], regs_.xmm[(int)rm_addr], 16);
-            else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(regs_.xmm[reg], mem_base_ + off, 16); }
+            else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(regs_.xmm[reg], mem_base_ + off, 16); }
             break;
         }
 
@@ -1954,7 +2006,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
             uint64_t rm_addr; bool rm_is_reg;
             decode_rm(modrm, &rm_addr, &rm_is_reg);
             if (rm_is_reg) memcpy(regs_.xmm[(int)rm_addr], regs_.xmm[reg], 16);
-            else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(mem_base_ + off, regs_.xmm[reg], 16); }
+            else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(mem_base_ + off, regs_.xmm[reg], 16); }
             break;
         }
 
@@ -2219,7 +2271,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
             decode_rm(modrm, &rm_addr, &rm_is_reg);
             uint8_t src[16];
             if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr], 16);
-            else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+            else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
             for (int i = 0; i < 16; i++) regs_.xmm[reg][i] ^= src[i];
             break;
         }
@@ -2525,12 +2577,12 @@ X86Exception X86Interpreter::DecodeAndExecute() {
         if (!legacy_simd) {
             auto mem_in = [&](uint64_t a, uint8_t* out, size_t n) {
                 uint64_t off = a - mem_base_addr_;
-                if (a >= mem_base_addr_ && off + n <= mem_size_) memcpy(out, mem_base_ + off, n);
+                if (Mapped(a, n)) memcpy(out, mem_base_ + off, n);
                 else memset(out, 0, n);
             };
             auto mem_out = [&](uint64_t a, const uint8_t* in, size_t n) {
                 uint64_t off = a - mem_base_addr_;
-                if (a >= mem_base_addr_ && off + n <= mem_size_) memcpy(mem_base_ + off, in, n);
+                if (Mapped(a, n)) memcpy(mem_base_ + off, in, n);
             };
             auto ymm_get = [&](int r, uint8_t* out) {
                 memcpy(out, regs_.xmm[r & 15], 16);
@@ -2672,13 +2724,15 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 if ((vex_pp >= 2) && (op == 0x10 || op == 0x11 || op == 0x2A || op == 0x2C || op == 0x2D ||
                                       (op >= 0x51 && op <= 0x5F) || op == 0xC2))
                     return 0;
-                if (op == 0x2E || op == 0x2F || op == 0x6E || op == 0x7E || op == 0xC4 || op == 0xC5 || op == 0xD6)
+                if (op == 0x2E || op == 0x2F || op == 0x6E || op == 0x7E || op == 0xC4 || op == 0xC5 || op == 0xD6 ||
+                    op == 0xAE)
                     return 0;
                 if (op == 0x5A || op == 0xE6) return -1;
                 return 1;
             }
-            if (vex_mmmmm == 2) return op >= 0xF0 ? 0 : 1;
+            if (vex_mmmmm == 2) return op >= 0xF0 ? 0 : op == 0x13 ? -1 : 1;
             if ((op >= 0x14 && op <= 0x17) || (op >= 0x20 && op <= 0x22) || op == 0xF0) return 0;
+            if (op == 0x1D) return -1;
             return 1;
         };
         int lanes = 1;
@@ -2705,6 +2759,29 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 memcpy(regs_.ymm_hi[i], tmp, 16);
             }
         };
+
+        auto ld = [&](uint64_t a, bool is_reg, void* out, size_t n) {
+            if (is_reg) memcpy(out, regs_.xmm[(int)a & 15], n);
+            else if (Mapped(a, n)) memcpy(out, mem_base_ + (a - mem_base_addr_), n);
+            else memset(out, 0, n);
+        };
+        // dst = op(vvvv, r/m) on 16-byte vectors
+        auto vex_binop = [&](auto fn) {
+            uint8_t modrm = read_modrm();
+            int reg = reg_field(modrm);
+            uint64_t a; bool is_reg;
+            decode_rm(modrm, &a, &is_reg);
+            uint8_t x[16], y[16], out[16];
+            memcpy(x, regs_.xmm[vex_vvvv & 15], 16);
+            ld(a, is_reg, y, 16);
+            fn(out, x, y);
+            memcpy(regs_.xmm[reg], out, 16);
+        };
+        auto i16 = [](const uint8_t* p, int i) { int16_t v; memcpy(&v, p + 2 * i, 2); return v; };
+        auto u16 = [](const uint8_t* p, int i) { uint16_t v; memcpy(&v, p + 2 * i, 2); return v; };
+        auto put16 = [](uint8_t* p, int i, int v) { uint16_t s = (uint16_t)v; memcpy(p + 2 * i, &s, 2); };
+        auto sat_s16 = [](int v) { return v > 32767 ? 32767 : v < -32768 ? -32768 : v; };
+        auto sat_u16 = [](int v) { return v > 65535 ? 65535 : v < 0 ? 0 : v; };
 
         for (int lane = 0; lane < lanes; lane++) {
         if (lane == 1) {
@@ -2747,7 +2824,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                         memcpy(regs_.xmm[reg], regs_.xmm[(int)rm_addr & 15], 16);
                     } else {
                         uint64_t off = rm_addr - mem_base_addr_;
-                        if (off + 16 <= mem_size_) memcpy(regs_.xmm[reg], mem_base_ + off, 16);
+                        if (Mapped(rm_addr, 16)) memcpy(regs_.xmm[reg], mem_base_ + off, 16);
                         else memset(regs_.xmm[reg], 0, 16);
                     }
                 }
@@ -2776,7 +2853,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                         memcpy(regs_.xmm[(int)rm_addr & 15], regs_.xmm[reg], 16);
                     } else {
                         uint64_t off = rm_addr - mem_base_addr_;
-                        if (off + 16 <= mem_size_) memcpy(mem_base_ + off, regs_.xmm[reg], 16);
+                        if (Mapped(rm_addr, 16)) memcpy(mem_base_ + off, regs_.xmm[reg], 16);
                     }
                 }
                 break;
@@ -2791,7 +2868,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 if (rm_is_reg) memcpy(regs_.xmm[reg], regs_.xmm[(int)rm_addr & 15], 16);
                 else {
                     uint64_t off = rm_addr - mem_base_addr_;
-                    if (off + 16 <= mem_size_) memcpy(regs_.xmm[reg], mem_base_ + off, 16);
+                    if (Mapped(rm_addr, 16)) memcpy(regs_.xmm[reg], mem_base_ + off, 16);
                 }
                 break;
             }
@@ -2803,7 +2880,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 if (rm_is_reg) memcpy(regs_.xmm[(int)rm_addr & 15], regs_.xmm[reg], 16);
                 else {
                     uint64_t off = rm_addr - mem_base_addr_;
-                    if (off + 16 <= mem_size_) memcpy(mem_base_ + off, regs_.xmm[reg], 16);
+                    if (Mapped(rm_addr, 16)) memcpy(mem_base_ + off, regs_.xmm[reg], 16);
                 }
                 break;
             }
@@ -2833,7 +2910,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 decode_rm(modrm, &rm_addr, &rm_is_reg);
                 uint8_t src[16];
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 uint8_t vvvv_data[16];
                 memcpy(vvvv_data, regs_.xmm[vex_vvvv & 15], 16);
                 for (int i = 0; i < 16; i++) regs_.xmm[reg][i] = vvvv_data[i] ^ src[i];
@@ -2861,7 +2938,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                     float src[4], dst[4];
                     memcpy(dst, regs_.xmm[vex_vvvv & 15], 16);
                     if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                    else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                    else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                     for (int i = 0; i < 4; i++) dst[i] *= src[i];
                     memcpy(regs_.xmm[reg], dst, 16);
                 }
@@ -2887,7 +2964,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                     float src_f[4], dst_f[4];
                     memcpy(dst_f, regs_.xmm[vex_vvvv & 15], 16);
                     if (rm_is_reg) memcpy(src_f, regs_.xmm[(int)rm_addr & 15], 16);
-                    else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
+                    else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
                     for (int i = 0; i < 4; i++) dst_f[i] += src_f[i];
                     memcpy(regs_.xmm[reg], dst_f, 16);
                 }
@@ -2913,7 +2990,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                     float src_f[4], dst_f[4];
                     memcpy(dst_f, regs_.xmm[vex_vvvv & 15], 16);
                     if (rm_is_reg) memcpy(src_f, regs_.xmm[(int)rm_addr & 15], 16);
-                    else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
+                    else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
                     for (int i = 0; i < 4; i++) dst_f[i] -= src_f[i];
                     memcpy(regs_.xmm[reg], dst_f, 16);
                 }
@@ -2939,7 +3016,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                     float src_f[4], dst_f[4];
                     memcpy(dst_f, regs_.xmm[vex_vvvv & 15], 16);
                     if (rm_is_reg) memcpy(src_f, regs_.xmm[(int)rm_addr & 15], 16);
-                    else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
+                    else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
                     for (int i = 0; i < 4; i++) dst_f[i] = (src_f[i] != 0.0f) ? dst_f[i] / src_f[i] : 0.0f;
                     memcpy(regs_.xmm[reg], dst_f, 16);
                 }
@@ -2955,7 +3032,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src_b[16], vvvv_b[16];
                 memcpy(vvvv_b, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src_b, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_b, mem_base_ + off, 16); else memset(src_b, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_b, mem_base_ + off, 16); else memset(src_b, 0, 16); }
                 for (int i = 0; i < 16; i++) regs_.xmm[reg][i] = vvvv_b[i] & src_b[i];
                 break;
             }
@@ -2969,7 +3046,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src_b[16], vvvv_b[16];
                 memcpy(vvvv_b, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src_b, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_b, mem_base_ + off, 16); else memset(src_b, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_b, mem_base_ + off, 16); else memset(src_b, 0, 16); }
                 for (int i = 0; i < 16; i++) regs_.xmm[reg][i] = (~vvvv_b[i]) & src_b[i];
                 break;
             }
@@ -2983,7 +3060,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src_b[16], vvvv_b[16];
                 memcpy(vvvv_b, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src_b, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_b, mem_base_ + off, 16); else memset(src_b, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_b, mem_base_ + off, 16); else memset(src_b, 0, 16); }
                 for (int i = 0; i < 16; i++) regs_.xmm[reg][i] = vvvv_b[i] | src_b[i];
                 break;
             }
@@ -3065,7 +3142,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint64_t rm_addr; bool rm_is_reg;
                 decode_rm(modrm, &rm_addr, &rm_is_reg);
                 if (rm_is_reg) memcpy(regs_.xmm[reg], regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(regs_.xmm[reg], mem_base_ + off, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(regs_.xmm[reg], mem_base_ + off, 16); }
                 break;
             }
             case 0x7F: {
@@ -3074,7 +3151,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint64_t rm_addr; bool rm_is_reg;
                 decode_rm(modrm, &rm_addr, &rm_is_reg);
                 if (rm_is_reg) memcpy(regs_.xmm[(int)rm_addr & 15], regs_.xmm[reg], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(mem_base_ + off, regs_.xmm[reg], 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(mem_base_ + off, regs_.xmm[reg], 16); }
                 break;
             }
 
@@ -3094,7 +3171,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 } else {
                     float src_f[4];
                     if (rm_is_reg) memcpy(src_f, regs_.xmm[(int)rm_addr & 15], 16);
-                    else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
+                    else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
                     for (int i = 0; i < 4; i++) src_f[i] = sqrtf(src_f[i]);
                     memcpy(regs_.xmm[reg], src_f, 16);
                 }
@@ -3119,7 +3196,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                     float src_f[4], dst_f[4];
                     memcpy(dst_f, regs_.xmm[vex_vvvv & 15], 16);
                     if (rm_is_reg) memcpy(src_f, regs_.xmm[(int)rm_addr & 15], 16);
-                    else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
+                    else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
                     for (int i = 0; i < 4; i++) dst_f[i] = (dst_f[i] < src_f[i]) ? dst_f[i] : src_f[i];
                     memcpy(regs_.xmm[reg], dst_f, 16);
                 }
@@ -3144,7 +3221,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                     float src_f[4], dst_f[4];
                     memcpy(dst_f, regs_.xmm[vex_vvvv & 15], 16);
                     if (rm_is_reg) memcpy(src_f, regs_.xmm[(int)rm_addr & 15], 16);
-                    else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
+                    else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
                     for (int i = 0; i < 4; i++) dst_f[i] = (dst_f[i] > src_f[i]) ? dst_f[i] : src_f[i];
                     memcpy(regs_.xmm[reg], dst_f, 16);
                 }
@@ -3158,10 +3235,19 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint64_t rm_addr; bool rm_is_reg;
                 decode_rm(modrm, &rm_addr, &rm_is_reg);
                 uint8_t imm = read_imm8();
+                if (vex_pp == 1) {  // VSHUFPD
+                    double x[2], y[2], r[2];
+                    memcpy(x, regs_.xmm[vex_vvvv & 15], 16);
+                    ld(rm_addr, rm_is_reg, y, 16);
+                    r[0] = x[(imm >> (2 * lane)) & 1];
+                    r[1] = y[(imm >> (2 * lane + 1)) & 1];
+                    memcpy(regs_.xmm[reg], r, 16);
+                    break;
+                }
                 float src_f[4], vvvv_f[4], dst_f[4];
                 memcpy(vvvv_f, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src_f, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
                 dst_f[0] = vvvv_f[(imm >> 0) & 3];
                 dst_f[1] = vvvv_f[(imm >> 2) & 3];
                 dst_f[2] = src_f[(imm >> 4) & 3];
@@ -3201,7 +3287,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                     uint32_t out[4];
                     memcpy(dst_f, regs_.xmm[vex_vvvv & 15], 16);
                     if (rm_is_reg) memcpy(src_f, regs_.xmm[(int)rm_addr & 15], 16);
-                    else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
+                    else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
                     for (int i = 0; i < 4; i++) {
                         bool c = false;
                         switch (imm & 7) {
@@ -3244,7 +3330,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src_b[16], vvvv_b[16];
                 memcpy(vvvv_b, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src_b, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_b, mem_base_ + off, 16); else memset(src_b, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_b, mem_base_ + off, 16); else memset(src_b, 0, 16); }
                 for (int i = 0; i < 16; i++) regs_.xmm[reg][i] = vvvv_b[i] ^ src_b[i];
                 break;
             }
@@ -3258,7 +3344,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint64_t src[2], vvvv_q[2];
                 memcpy(vvvv_q, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 vvvv_q[0] += src[0];
                 vvvv_q[1] += src[1];
                 memcpy(regs_.xmm[reg], vvvv_q, 16);
@@ -3274,7 +3360,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint64_t src[2], vvvv_q[2];
                 memcpy(vvvv_q, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 vvvv_q[0] -= src[0];
                 vvvv_q[1] -= src[1];
                 memcpy(regs_.xmm[reg], vvvv_q, 16);
@@ -3353,7 +3439,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t imm = read_imm8();
                 uint32_t src_d[4];
                 if (rm_is_reg) memcpy(src_d, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_d, mem_base_ + off, 16); else memset(src_d, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_d, mem_base_ + off, 16); else memset(src_d, 0, 16); }
                 uint32_t dst_d[4];
                 dst_d[0] = src_d[(imm >> 0) & 3];
                 dst_d[1] = src_d[(imm >> 2) & 3];
@@ -3372,7 +3458,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src[16], vvvv_b[16];
                 memcpy(vvvv_b, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 if (vex_opcode == 0x74) { // byte
                     for (int i = 0; i < 16; i++) regs_.xmm[reg][i] = (vvvv_b[i] == src[i]) ? 0xFF : 0;
                 } else if (vex_opcode == 0x75) { // word
@@ -3392,7 +3478,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src[16], vvvv_b[16];
                 memcpy(vvvv_b, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 if (vex_opcode == 0x64) { for (int i = 0; i < 16; i++) regs_.xmm[reg][i] = ((int8_t)vvvv_b[i] > (int8_t)src[i]) ? 0xFF : 0; }
                 else if (vex_opcode == 0x65) { for (int i = 0; i < 8; i++) { int16_t a, b; memcpy(&a, vvvv_b + i*2, 2); memcpy(&b, src + i*2, 2); uint16_t r = (a > b) ? 0xFFFF : 0; memcpy(regs_.xmm[reg] + i*2, &r, 2); } }
                 else { for (int i = 0; i < 4; i++) { int32_t a, b; memcpy(&a, vvvv_b + i*4, 4); memcpy(&b, src + i*4, 4); uint32_t r = (a > b) ? 0xFFFFFFFF : 0; memcpy(regs_.xmm[reg] + i*4, &r, 4); } }
@@ -3408,7 +3494,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src[16], vvvv_b[16];
                 memcpy(vvvv_b, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 for (int i = 0; i < 16; i++) regs_.xmm[reg][i] = vvvv_b[i] & src[i];
                 break;
             }
@@ -3422,7 +3508,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src[16], vvvv_b[16];
                 memcpy(vvvv_b, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 for (int i = 0; i < 16; i++) regs_.xmm[reg][i] = (~vvvv_b[i]) & src[i];
                 break;
             }
@@ -3436,7 +3522,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src[16], vvvv_b[16];
                 memcpy(vvvv_b, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 for (int i = 0; i < 16; i++) regs_.xmm[reg][i] = vvvv_b[i] | src[i];
                 break;
             }
@@ -3450,7 +3536,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src[16], vvvv_b[16];
                 memcpy(vvvv_b, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 if (vex_opcode == 0xFC) { for (int i = 0; i < 16; i++) regs_.xmm[reg][i] = vvvv_b[i] + src[i]; }
                 else if (vex_opcode == 0xFD) { for (int i = 0; i < 8; i++) { uint16_t a, b; memcpy(&a, vvvv_b+i*2, 2); memcpy(&b, src+i*2, 2); a += b; memcpy(regs_.xmm[reg]+i*2, &a, 2); } }
                 else if (vex_opcode == 0xFE) { for (int i = 0; i < 4; i++) { uint32_t a, b; memcpy(&a, vvvv_b+i*4, 4); memcpy(&b, src+i*4, 4); a += b; memcpy(regs_.xmm[reg]+i*4, &a, 4); } }
@@ -3467,7 +3553,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src[16], vvvv_b[16];
                 memcpy(vvvv_b, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 if (vex_opcode == 0xF8) { for (int i = 0; i < 16; i++) regs_.xmm[reg][i] = vvvv_b[i] - src[i]; }
                 else { for (int i = 0; i < 8; i++) { uint16_t a, b; memcpy(&a, vvvv_b+i*2, 2); memcpy(&b, src+i*2, 2); a -= b; memcpy(regs_.xmm[reg]+i*2, &a, 2); } }
                 break;
@@ -3481,9 +3567,9 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 decode_rm(modrm, &rm_addr, &rm_is_reg);
                 uint8_t src_raw[16];
                 if (rm_is_reg) memcpy(src_raw, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_raw, mem_base_ + off, 16); else memset(src_raw, 0, 16); }
-                if (vex_pp == 1) { // 66: VCVTPS2DQ
-                    for (int i = 0; i < 4; i++) { float f; memcpy(&f, src_raw + i*4, 4); int32_t r = (int32_t)f; memcpy(regs_.xmm[reg] + i*4, &r, 4); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_raw, mem_base_ + off, 16); else memset(src_raw, 0, 16); }
+                if (vex_pp == 1 || vex_pp == 2) { // 66: VCVTPS2DQ (round), F3: VCVTTPS2DQ (truncate)
+                    for (int i = 0; i < 4; i++) { float f; memcpy(&f, src_raw + i*4, 4); int32_t r = CvtToI32(f, vex_pp == 2); memcpy(regs_.xmm[reg] + i*4, &r, 4); }
                 } else { // no prefix: VCVTDQ2PS
                     for (int i = 0; i < 4; i++) { int32_t d; memcpy(&d, src_raw + i*4, 4); float f = (float)d; memcpy(regs_.xmm[reg] + i*4, &f, 4); }
                 }
@@ -3504,7 +3590,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                     float f = (float)d; memcpy(regs_.xmm[reg], regs_.xmm[vex_vvvv & 15], 16); memcpy(regs_.xmm[reg], &f, 4);
                 } else { // VCVTPS2PD
                     uint8_t src_raw[16]; if (rm_is_reg) memcpy(src_raw, regs_.xmm[(int)rm_addr & 15], 16);
-                    else { uint64_t off = rm_addr - mem_base_addr_; if (off + 8 <= mem_size_) memcpy(src_raw, mem_base_ + off, 8); else memset(src_raw, 0, 8); }
+                    else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 8)) memcpy(src_raw, mem_base_ + off, 8); else memset(src_raw, 0, 8); }
                     for (int i = 0; i < 2; i++) { float f; memcpy(&f, src_raw + i*4, 4); double d = (double)f; memcpy(regs_.xmm[reg] + i*8, &d, 8); }
                 }
                 break;
@@ -3519,7 +3605,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint32_t src[4], vvvv_d[4];
                 memcpy(vvvv_d, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 uint32_t dst[4];
                 if (vex_opcode == 0x14) { dst[0]=vvvv_d[0]; dst[1]=src[0]; dst[2]=vvvv_d[1]; dst[3]=src[1]; }
                 else                    { dst[0]=vvvv_d[2]; dst[1]=src[2]; dst[2]=vvvv_d[3]; dst[3]=src[3]; }
@@ -3536,10 +3622,10 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 memcpy(regs_.xmm[reg], regs_.xmm[vex_vvvv & 15], 16);
                 if (vex_opcode == 0x16) {
                     if (rm_is_reg) memcpy(regs_.xmm[reg] + 8, regs_.xmm[(int)rm_addr & 15], 8); // VMOVLHPS
-                    else { uint64_t off = rm_addr - mem_base_addr_; if (off + 8 <= mem_size_) memcpy(regs_.xmm[reg] + 8, mem_base_ + off, 8); } // VMOVHPS load
+                    else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 8)) memcpy(regs_.xmm[reg] + 8, mem_base_ + off, 8); } // VMOVHPS load
                 } else {
                     if (rm_is_reg) memcpy(regs_.xmm[reg], regs_.xmm[(int)rm_addr & 15] + 8, 8); // VMOVHLPS
-                    else { uint64_t off = rm_addr - mem_base_addr_; if (off + 8 <= mem_size_) memcpy(regs_.xmm[reg], mem_base_ + off, 8); } // VMOVLPS load
+                    else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 8)) memcpy(regs_.xmm[reg], mem_base_ + off, 8); } // VMOVLPS load
                 }
                 break;
             }
@@ -3552,7 +3638,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 decode_rm(modrm, &rm_addr, &rm_is_reg);
                 if (!rm_is_reg) {
                     uint64_t off = rm_addr - mem_base_addr_;
-                    if (off + 8 <= mem_size_) {
+                    if (Mapped(rm_addr, 8)) {
                         if (vex_opcode == 0x17) memcpy(mem_base_ + off, regs_.xmm[reg] + 8, 8);
                         else memcpy(mem_base_ + off, regs_.xmm[reg], 8);
                     }
@@ -3679,7 +3765,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 } else { // packed
                     float src_f[4];
                     if (rm_is_reg) memcpy(src_f, regs_.xmm[(int)rm_addr & 15], 16);
-                    else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
+                    else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
                     for (int i = 0; i < 4; i++) src_f[i] = (vex_opcode == 0x52) ? (1.0f / sqrtf(src_f[i])) : (1.0f / src_f[i]);
                     memcpy(regs_.xmm[reg], src_f, 16);
                 }
@@ -3695,7 +3781,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint32_t src[4], vvvv_d[4];
                 memcpy(vvvv_d, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 uint32_t dst[4];
                 if (vex_opcode == 0x62) { dst[0]=vvvv_d[0]; dst[1]=src[0]; dst[2]=vvvv_d[1]; dst[3]=src[1]; }
                 else                    { dst[0]=vvvv_d[2]; dst[1]=src[2]; dst[2]=vvvv_d[3]; dst[3]=src[3]; }
@@ -3712,7 +3798,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint64_t src_hi, vvvv_hi;
                 memcpy(&vvvv_hi, regs_.xmm[vex_vvvv & 15] + 8, 8);
                 if (rm_is_reg) memcpy(&src_hi, regs_.xmm[(int)rm_addr & 15] + 8, 8);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(&src_hi, mem_base_ + off + 8, 8); else src_hi = 0; }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(&src_hi, mem_base_ + off + 8, 8); else src_hi = 0; }
                 memcpy(regs_.xmm[reg], &vvvv_hi, 8);
                 memcpy(regs_.xmm[reg] + 8, &src_hi, 8);
                 break;
@@ -3727,7 +3813,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src[16], vvvv_b2[16];
                 memcpy(vvvv_b2, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 uint8_t dst[16];
                 bool high = (vex_opcode == 0x68 || vex_opcode == 0x69);
                 if (vex_opcode == 0x60 || vex_opcode == 0x68) { // byte interleave
@@ -3761,7 +3847,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src[16], vvvv_b2[16];
                 memcpy(vvvv_b2, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 uint8_t dst[16];
                 if (vex_opcode == 0x6B) { // PACKSSDW
                     for (int i = 0; i < 4; i++) { int32_t v; memcpy(&v, vvvv_b2+i*4, 4); int16_t r = v > 32767 ? 32767 : (v < -32768 ? -32768 : (int16_t)v); memcpy(dst+i*2, &r, 2); }
@@ -3786,7 +3872,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint16_t src_w[8], vvvv_w[8];
                 memcpy(vvvv_w, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src_w, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_w, mem_base_ + off, 16); else memset(src_w, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_w, mem_base_ + off, 16); else memset(src_w, 0, 16); }
                 uint16_t dst_w[8];
                 for (int i = 0; i < 8; i++) {
                     if (vex_opcode == 0xD5) dst_w[i] = (uint16_t)((uint32_t)vvvv_w[i] * (uint32_t)src_w[i]); // low
@@ -3806,7 +3892,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 int16_t src_w[8], vvvv_w[8];
                 memcpy(vvvv_w, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src_w, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_w, mem_base_ + off, 16); else memset(src_w, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_w, mem_base_ + off, 16); else memset(src_w, 0, 16); }
                 int32_t dst_d[4];
                 for (int i = 0; i < 4; i++) dst_d[i] = (int32_t)vvvv_w[i*2] * (int32_t)src_w[i*2] + (int32_t)vvvv_w[i*2+1] * (int32_t)src_w[i*2+1];
                 memcpy(regs_.xmm[reg], dst_d, 16);
@@ -3823,7 +3909,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src[16], vvvv_b2[16];
                 memcpy(vvvv_b2, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 for (int i = 0; i < 16; i++)
                     regs_.xmm[reg][i] = (vex_opcode == 0xDA) ? std::min(vvvv_b2[i], src[i]) : std::max(vvvv_b2[i], src[i]);
                 break;
@@ -3872,8 +3958,151 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 decode_rm(modrm, &rm_addr, &rm_is_reg);
                 if (!rm_is_reg) {
                     uint64_t off = rm_addr - mem_base_addr_;
-                    if (off + 16 <= mem_size_) memcpy(mem_base_ + off, regs_.xmm[reg], 16);
+                    if (Mapped(rm_addr, 16)) memcpy(mem_base_ + off, regs_.xmm[reg], 16);
                 }
+                break;
+            }
+
+            case 0xF4:  // VPMULUDQ
+                vex_binop([&](uint8_t* o, const uint8_t* x, const uint8_t* y) {
+                    for (int i = 0; i < 2; i++) {
+                        uint32_t a, b; memcpy(&a, x + 8 * i, 4); memcpy(&b, y + 8 * i, 4);
+                        uint64_t p = (uint64_t)a * b; memcpy(o + 8 * i, &p, 8);
+                    }
+                });
+                break;
+            case 0xF6:  // VPSADBW
+                vex_binop([&](uint8_t* o, const uint8_t* x, const uint8_t* y) {
+                    memset(o, 0, 16);
+                    for (int h = 0; h < 2; h++) {
+                        int s = 0;
+                        for (int i = 0; i < 8; i++) s += std::abs((int)x[h * 8 + i] - (int)y[h * 8 + i]);
+                        put16(o, h * 4, s);
+                    }
+                });
+                break;
+            case 0xE0:  // VPAVGB
+                vex_binop([&](uint8_t* o, const uint8_t* x, const uint8_t* y) {
+                    for (int i = 0; i < 16; i++) o[i] = (uint8_t)((x[i] + y[i] + 1) >> 1);
+                });
+                break;
+            case 0xE3:  // VPAVGW
+                vex_binop([&](uint8_t* o, const uint8_t* x, const uint8_t* y) {
+                    for (int i = 0; i < 8; i++) put16(o, i, (u16(x, i) + u16(y, i) + 1) >> 1);
+                });
+                break;
+            case 0xD8: case 0xD9: case 0xDC: case 0xDD: case 0xE8: case 0xE9: case 0xEC: case 0xED: {
+                // saturating add/sub: D8/D9 PSUBUS B/W, DC/DD PADDUS B/W, E8/E9 PSUBS B/W, EC/ED PADDS B/W
+                const uint8_t op = vex_opcode;
+                const bool word = op & 1, add = (op & 0x04) != 0, is_signed = op >= 0xE8;
+                vex_binop([&](uint8_t* o, const uint8_t* x, const uint8_t* y) {
+                    if (word) {
+                        for (int i = 0; i < 8; i++) {
+                            int a = is_signed ? i16(x, i) : u16(x, i), b = is_signed ? i16(y, i) : u16(y, i);
+                            int r = add ? a + b : a - b;
+                            put16(o, i, is_signed ? sat_s16(r) : sat_u16(r));
+                        }
+                    } else {
+                        for (int i = 0; i < 16; i++) {
+                            int a = is_signed ? (int8_t)x[i] : x[i], b = is_signed ? (int8_t)y[i] : y[i];
+                            int r = add ? a + b : a - b;
+                            o[i] = (uint8_t)(is_signed ? std::clamp(r, -128, 127) : std::clamp(r, 0, 255));
+                        }
+                    }
+                });
+                break;
+            }
+            case 0xEA: case 0xEE: {  // VPMINSW / VPMAXSW
+                const bool mx = vex_opcode == 0xEE;
+                vex_binop([&](uint8_t* o, const uint8_t* x, const uint8_t* y) {
+                    for (int i = 0; i < 8; i++) put16(o, i, mx ? std::max(i16(x, i), i16(y, i)) : std::min(i16(x, i), i16(y, i)));
+                });
+                break;
+            }
+            case 0x7C: case 0x7D: {  // VHADDPS/VHSUBPS (F2), VHADDPD/VHSUBPD (66)
+                const bool sub = vex_opcode == 0x7D;
+                if (vex_pp == 3) {
+                    vex_binop([&](uint8_t* o, const uint8_t* x, const uint8_t* y) {
+                        float a[4], b[4], r[4];
+                        memcpy(a, x, 16); memcpy(b, y, 16);
+                        r[0] = sub ? a[0] - a[1] : a[0] + a[1]; r[1] = sub ? a[2] - a[3] : a[2] + a[3];
+                        r[2] = sub ? b[0] - b[1] : b[0] + b[1]; r[3] = sub ? b[2] - b[3] : b[2] + b[3];
+                        memcpy(o, r, 16);
+                    });
+                } else {
+                    vex_binop([&](uint8_t* o, const uint8_t* x, const uint8_t* y) {
+                        double a[2], b[2], r[2];
+                        memcpy(a, x, 16); memcpy(b, y, 16);
+                        r[0] = sub ? a[0] - a[1] : a[0] + a[1]; r[1] = sub ? b[0] - b[1] : b[0] + b[1];
+                        memcpy(o, r, 16);
+                    });
+                }
+                break;
+            }
+            case 0xD0:  // VADDSUBPS (F2) / VADDSUBPD (66)
+                if (vex_pp == 3) {
+                    vex_binop([&](uint8_t* o, const uint8_t* x, const uint8_t* y) {
+                        float a[4], b[4];
+                        memcpy(a, x, 16); memcpy(b, y, 16);
+                        for (int i = 0; i < 4; i++) a[i] = (i & 1) ? a[i] + b[i] : a[i] - b[i];
+                        memcpy(o, a, 16);
+                    });
+                } else {
+                    vex_binop([&](uint8_t* o, const uint8_t* x, const uint8_t* y) {
+                        double a[2], b[2];
+                        memcpy(a, x, 16); memcpy(b, y, 16);
+                        a[0] -= b[0]; a[1] += b[1];
+                        memcpy(o, a, 16);
+                    });
+                }
+                break;
+            case 0xE6: {  // 66: CVTTPD2DQ, F2: CVTPD2DQ, F3: CVTDQ2PD
+                uint8_t modrm = read_modrm();
+                int reg = reg_field(modrm);
+                uint64_t a; bool is_reg;
+                decode_rm(modrm, &a, &is_reg);
+                uint8_t out[16] = {};
+                if (vex_pp == 2) {
+                    int32_t s[2]; ld(a, is_reg, s, 8);
+                    double d[2] = {(double)s[0], (double)s[1]};
+                    memcpy(out, d, 16);
+                } else if (vex_pp == 1 || vex_pp == 3) {
+                    double s[2]; ld(a, is_reg, s, 16);
+                    int32_t r[2] = {CvtToI32(s[0], vex_pp == 1), CvtToI32(s[1], vex_pp == 1)};
+                    memcpy(out, r, 8);
+                } else {
+                    return X86Exception::InvalidOpcode;
+                }
+                memcpy(regs_.xmm[reg], out, 16);
+                break;
+            }
+            case 0x2D: {  // VCVTSS2SI (F3) / VCVTSD2SI (F2), rounding
+                uint8_t modrm = read_modrm();
+                int reg = reg_field(modrm);
+                uint64_t a; bool is_reg;
+                decode_rm(modrm, &a, &is_reg);
+                double v;
+                if (vex_pp == 2) { float f; ld(a, is_reg, &f, 4); v = f; }
+                else if (vex_pp == 3) { ld(a, is_reg, &v, 8); }
+                else return X86Exception::InvalidOpcode;
+                RegByIndex(reg) = vex_W ? (uint64_t)CvtToI64(v, false) : (uint64_t)(uint32_t)CvtToI32(v, false);
+                break;
+            }
+            case 0x2B: {  // VMOVNTPS / VMOVNTPD (store)
+                uint8_t modrm = read_modrm();
+                int reg = reg_field(modrm);
+                uint64_t a; bool is_reg;
+                decode_rm(modrm, &a, &is_reg);
+                if (!is_reg && Mapped(a, 16)) memcpy(mem_base_ + (a - mem_base_addr_), regs_.xmm[reg], 16);
+                break;
+            }
+            case 0xAE: {  // VLDMXCSR (/2), VSTMXCSR (/3)
+                uint8_t modrm = read_modrm();
+                int sub = (modrm >> 3) & 7;
+                uint64_t a; bool is_reg;
+                decode_rm(modrm, &a, &is_reg);
+                if (is_reg || (sub != 2 && sub != 3)) return X86Exception::InvalidOpcode;
+                if (sub == 3) WriteMemory32(a, 0x1F80);
                 break;
             }
 
@@ -3948,7 +4177,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src[16], vvvv_b2[16];
                 memcpy(vvvv_b2, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 uint8_t dst[16];
                 for (int i = 0; i < 16; i++) dst[i] = (src[i] & 0x80) ? 0 : vvvv_b2[src[i] & 15];
                 memcpy(regs_.xmm[reg], dst, 16);
@@ -3964,7 +4193,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint32_t src[4], vvvv_d[4];
                 memcpy(vvvv_d, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 for (int i = 0; i < 4; i++) vvvv_d[i] *= src[i];
                 memcpy(regs_.xmm[reg], vvvv_d, 16);
                 break;
@@ -3979,7 +4208,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint64_t src[2], vvvv_q[2];
                 memcpy(vvvv_q, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 for (int i = 0; i < 2; i++) vvvv_q[i] = (vvvv_q[i] == src[i]) ? ~0ULL : 0;
                 memcpy(regs_.xmm[reg], vvvv_q, 16);
                 break;
@@ -3994,7 +4223,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src[16], vvvv_b2[16];
                 memcpy(vvvv_b2, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 if (vex_opcode == 0x38) { for (int i = 0; i < 16; i++) regs_.xmm[reg][i] = ((int8_t)vvvv_b2[i] < (int8_t)src[i]) ? vvvv_b2[i] : src[i]; }
                 else if (vex_opcode == 0x39) { for (int i = 0; i < 4; i++) { int32_t a,b; memcpy(&a, vvvv_b2+i*4, 4); memcpy(&b, src+i*4, 4); int32_t r = a < b ? a : b; memcpy(regs_.xmm[reg]+i*4, &r, 4); } }
                 else if (vex_opcode == 0x3A) { for (int i = 0; i < 8; i++) { uint16_t a,b; memcpy(&a, vvvv_b2+i*2, 2); memcpy(&b, src+i*2, 2); uint16_t r = a < b ? a : b; memcpy(regs_.xmm[reg]+i*2, &r, 2); } }
@@ -4015,7 +4244,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 decode_rm(modrm, &rm_addr, &rm_is_reg);
                 uint8_t src[16];
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 memset(regs_.xmm[reg], 0, 16);
                 if (vex_opcode == 0x30) { for (int i = 0; i < 8; i++) { uint16_t v = src[i]; memcpy(regs_.xmm[reg]+i*2, &v, 2); } }
                 else if (vex_opcode == 0x31) { for (int i = 0; i < 4; i++) { uint32_t v = src[i]; memcpy(regs_.xmm[reg]+i*4, &v, 4); } }
@@ -4035,7 +4264,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 decode_rm(modrm, &rm_addr, &rm_is_reg);
                 uint8_t src[16];
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 memset(regs_.xmm[reg], 0, 16);
                 if (vex_opcode == 0x20) { for (int i = 0; i < 8; i++) { int16_t v = (int8_t)src[i]; memcpy(regs_.xmm[reg]+i*2, &v, 2); } }
                 else if (vex_opcode == 0x21) { for (int i = 0; i < 4; i++) { int32_t v = (int8_t)src[i]; memcpy(regs_.xmm[reg]+i*4, &v, 4); } }
@@ -4055,7 +4284,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src[16], dst[16];
                 memcpy(dst, regs_.xmm[reg], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 bool all_and_zero = true, all_andn_zero = true;
                 for (int i = 0; i < 16; i++) { if (dst[i] & src[i]) all_and_zero = false; if ((~dst[i]) & src[i]) all_andn_zero = false; }
                 SetZF(all_and_zero); SetCF(all_andn_zero);
@@ -4072,11 +4301,164 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src[16], dst[16];
                 memcpy(dst, regs_.xmm[reg], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 bool all_and_zero = true, all_andn_zero = true;
                 for (int i = 0; i < 16; i++) { if (dst[i] & src[i]) all_and_zero = false; if ((~dst[i]) & src[i]) all_andn_zero = false; }
                 SetZF(all_and_zero); SetCF(all_andn_zero);
                 SetOF(false); SetSF(false); SetAF(false); SetPF(false);
+                break;
+            }
+
+            // FMA3: 9x = 132, Ax = 213, Bx = 231 operand order; low nibble picks the operation.
+            case 0x96: case 0x97: case 0x98: case 0x99: case 0x9A: case 0x9B: case 0x9C: case 0x9D: case 0x9E: case 0x9F:
+            case 0xA6: case 0xA7: case 0xA8: case 0xA9: case 0xAA: case 0xAB: case 0xAC: case 0xAD: case 0xAE: case 0xAF:
+            case 0xB6: case 0xB7: case 0xB8: case 0xB9: case 0xBA: case 0xBB: case 0xBC: case 0xBD: case 0xBE: case 0xBF: {
+                uint8_t modrm = read_modrm();
+                int reg = reg_field(modrm);
+                uint64_t a; bool is_reg;
+                decode_rm(modrm, &a, &is_reg);
+                const int kind = vex_opcode & 0xF, order = vex_opcode >> 4;
+                const bool scalar = kind >= 8 && (kind & 1);
+                const bool dbl = vex_W;
+                const int esz = dbl ? 8 : 4, n = scalar ? 1 : 16 / esz;
+                uint8_t d[16], v[16], m[16] = {};
+                memcpy(d, regs_.xmm[reg], 16);
+                memcpy(v, regs_.xmm[vex_vvvv & 15], 16);
+                ld(a, is_reg, m, scalar ? esz : 16);
+                uint8_t out[16];
+                memcpy(out, d, 16);
+                for (int i = 0; i < n; i++) {
+                    double x1, x2, x3;  // dst, vvvv, r/m
+                    if (dbl) { memcpy(&x1, d + 8 * i, 8); memcpy(&x2, v + 8 * i, 8); memcpy(&x3, m + 8 * i, 8); }
+                    else { float f1, f2, f3; memcpy(&f1, d + 4 * i, 4); memcpy(&f2, v + 4 * i, 4); memcpy(&f3, m + 4 * i, 4); x1 = f1; x2 = f2; x3 = f3; }
+                    double p, q, c;  // result = +/-(p*q) +/- c
+                    if (order == 9) { p = x1; q = x3; c = x2; }
+                    else if (order == 0xA) { p = x2; q = x1; c = x3; }
+                    else { p = x2; q = x3; c = x1; }
+                    bool neg_prod = false, neg_c = false;
+                    switch (kind) {
+                        case 6: neg_c = !(i & 1); break;           // fmaddsub: even lanes subtract
+                        case 7: neg_c = (i & 1); break;            // fmsubadd: odd lanes subtract
+                        case 8: case 9: break;                     // fmadd
+                        case 0xA: case 0xB: neg_c = true; break;   // fmsub
+                        case 0xC: case 0xD: neg_prod = true; break;// fnmadd
+                        default: neg_prod = true; neg_c = true;    // fnmsub
+                    }
+                    if (neg_prod) p = -p;
+                    if (neg_c) c = -c;
+                    if (dbl) { double r = std::fma(p, q, c); memcpy(out + 8 * i, &r, 8); }
+                    else { float r = std::fmaf((float)p, (float)q, (float)c); memcpy(out + 4 * i, &r, 4); }
+                }
+                memcpy(regs_.xmm[reg], out, 16);
+                break;
+            }
+            case 0x45: case 0x46: case 0x47: {  // VPSRLVD/Q, VPSRAVD, VPSLLVD/Q
+                const uint8_t op = vex_opcode;
+                const bool q = vex_W && op != 0x46;
+                vex_binop([&](uint8_t* o, const uint8_t* x, const uint8_t* y) {
+                    if (q) {
+                        for (int i = 0; i < 2; i++) {
+                            uint64_t a, c; memcpy(&a, x + 8 * i, 8); memcpy(&c, y + 8 * i, 8);
+                            uint64_t r = c > 63 ? 0 : (op == 0x47 ? a << c : a >> c);
+                            memcpy(o + 8 * i, &r, 8);
+                        }
+                    } else {
+                        for (int i = 0; i < 4; i++) {
+                            uint32_t a, c; memcpy(&a, x + 4 * i, 4); memcpy(&c, y + 4 * i, 4);
+                            uint32_t r;
+                            if (op == 0x46) r = (uint32_t)((int32_t)a >> (c > 31 ? 31 : c));
+                            else r = c > 31 ? 0 : (op == 0x47 ? a << c : a >> c);
+                            memcpy(o + 4 * i, &r, 4);
+                        }
+                    }
+                });
+                break;
+            }
+            case 0x37:  // VPCMPGTQ
+                vex_binop([&](uint8_t* o, const uint8_t* x, const uint8_t* y) {
+                    for (int i = 0; i < 2; i++) {
+                        int64_t a, b; memcpy(&a, x + 8 * i, 8); memcpy(&b, y + 8 * i, 8);
+                        uint64_t r = a > b ? ~0ULL : 0; memcpy(o + 8 * i, &r, 8);
+                    }
+                });
+                break;
+            case 0x28:  // VPMULDQ
+                vex_binop([&](uint8_t* o, const uint8_t* x, const uint8_t* y) {
+                    for (int i = 0; i < 2; i++) {
+                        int32_t a, b; memcpy(&a, x + 8 * i, 4); memcpy(&b, y + 8 * i, 4);
+                        int64_t p = (int64_t)a * b; memcpy(o + 8 * i, &p, 8);
+                    }
+                });
+                break;
+            case 0x2B:  // VPACKUSDW
+                vex_binop([&](uint8_t* o, const uint8_t* x, const uint8_t* y) {
+                    for (int i = 0; i < 4; i++) {
+                        int32_t a, b; memcpy(&a, x + 4 * i, 4); memcpy(&b, y + 4 * i, 4);
+                        put16(o, i, std::clamp(a, 0, 65535)); put16(o, 4 + i, std::clamp(b, 0, 65535));
+                    }
+                });
+                break;
+            case 0x1C: case 0x1D: case 0x1E: {  // VPABSB/W/D
+                uint8_t modrm = read_modrm();
+                int reg = reg_field(modrm);
+                uint64_t a; bool is_reg;
+                decode_rm(modrm, &a, &is_reg);
+                uint8_t s[16], o[16];
+                ld(a, is_reg, s, 16);
+                if (vex_opcode == 0x1C) for (int i = 0; i < 16; i++) o[i] = (uint8_t)std::abs((int)(int8_t)s[i]);
+                else if (vex_opcode == 0x1D) for (int i = 0; i < 8; i++) put16(o, i, std::abs((int)i16(s, i)));
+                else for (int i = 0; i < 4; i++) { int32_t v; memcpy(&v, s + 4 * i, 4); uint32_t r = v < 0 ? 0u - (uint32_t)v : (uint32_t)v; memcpy(o + 4 * i, &r, 4); }
+                memcpy(regs_.xmm[reg], o, 16);
+                break;
+            }
+            case 0x0C: case 0x0D: {  // VPERMILPS / VPERMILPD with a vector control
+                const bool pd = vex_opcode == 0x0D;
+                vex_binop([&](uint8_t* o, const uint8_t* x, const uint8_t* y) {
+                    if (pd) for (int i = 0; i < 2; i++) { uint64_t c; memcpy(&c, y + 8 * i, 8); memcpy(o + 8 * i, x + 8 * ((c >> 1) & 1), 8); }
+                    else for (int i = 0; i < 4; i++) { uint32_t c; memcpy(&c, y + 4 * i, 4); memcpy(o + 4 * i, x + 4 * (c & 3), 4); }
+                });
+                break;
+            }
+            case 0x04:  // VPMADDUBSW
+                vex_binop([&](uint8_t* o, const uint8_t* x, const uint8_t* y) {
+                    for (int i = 0; i < 8; i++)
+                        put16(o, i, sat_s16(x[2 * i] * (int8_t)y[2 * i] + x[2 * i + 1] * (int8_t)y[2 * i + 1]));
+                });
+                break;
+            case 0x01: case 0x02: case 0x05: case 0x06: {  // VPHADDW/D, VPHSUBW/D
+                const bool sub = vex_opcode >= 0x05, dword = (vex_opcode & 3) == 2;
+                vex_binop([&](uint8_t* o, const uint8_t* x, const uint8_t* y) {
+                    if (dword) {
+                        int32_t a[4], b[4], r[4];
+                        memcpy(a, x, 16); memcpy(b, y, 16);
+                        for (int i = 0; i < 2; i++) {
+                            r[i] = (int32_t)(sub ? (uint32_t)a[2 * i] - (uint32_t)a[2 * i + 1] : (uint32_t)a[2 * i] + (uint32_t)a[2 * i + 1]);
+                            r[2 + i] = (int32_t)(sub ? (uint32_t)b[2 * i] - (uint32_t)b[2 * i + 1] : (uint32_t)b[2 * i] + (uint32_t)b[2 * i + 1]);
+                        }
+                        memcpy(o, r, 16);
+                    } else {
+                        for (int i = 0; i < 4; i++) {
+                            put16(o, i, sub ? i16(x, 2 * i) - i16(x, 2 * i + 1) : i16(x, 2 * i) + i16(x, 2 * i + 1));
+                            put16(o, 4 + i, sub ? i16(y, 2 * i) - i16(y, 2 * i + 1) : i16(y, 2 * i) + i16(y, 2 * i + 1));
+                        }
+                    }
+                });
+                break;
+            }
+            case 0x0B:  // VPMULHRSW
+                vex_binop([&](uint8_t* o, const uint8_t* x, const uint8_t* y) {
+                    for (int i = 0; i < 8; i++) put16(o, i, (((int32_t)i16(x, i) * i16(y, i) >> 14) + 1) >> 1);
+                });
+                break;
+            case 0x13: {  // VCVTPH2PS
+                uint8_t modrm = read_modrm();
+                int reg = reg_field(modrm);
+                uint64_t a; bool is_reg;
+                decode_rm(modrm, &a, &is_reg);
+                uint16_t h[4]; float f[4];
+                ld(a, is_reg, h, 8);
+                for (int i = 0; i < 4; i++) f[i] = HalfToFloat(h[i]);
+                memcpy(regs_.xmm[reg], f, 16);
                 break;
             }
 
@@ -4158,7 +4540,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t imm = read_imm8();
                 float src_f[4], dst_f[4];
                 if (rm_is_reg) memcpy(src_f, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
                 dst_f[0] = src_f[(imm >> 0) & 3];
                 dst_f[1] = src_f[(imm >> 2) & 3];
                 dst_f[2] = src_f[(imm >> 4) & 3];
@@ -4175,9 +4557,9 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t imm = read_imm8();
                 double src_d[2], dst_d[2];
                 if (rm_is_reg) memcpy(src_d, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_d, mem_base_ + off, 16); else memset(src_d, 0, 16); }
-                dst_d[0] = src_d[(imm >> 0) & 1];
-                dst_d[1] = src_d[(imm >> 1) & 1];
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_d, mem_base_ + off, 16); else memset(src_d, 0, 16); }
+                dst_d[0] = src_d[(imm >> (2 * lane)) & 1];
+                dst_d[1] = src_d[(imm >> (2 * lane + 1)) & 1];
                 memcpy(regs_.xmm[reg], dst_d, 16);
                 break;
             }
@@ -4215,9 +4597,9 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint32_t src[4], vvvv_d[4];
                 memcpy(vvvv_d, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 for (int i = 0; i < 4; i++)
-                    memcpy(regs_.xmm[reg] + i*4, (imm & (1 << i)) ? (uint8_t*)&src[i] : (uint8_t*)&vvvv_d[i], 4);
+                    memcpy(regs_.xmm[reg] + i*4, ((imm >> (i + 4 * lane)) & 1) ? (uint8_t*)&src[i] : (uint8_t*)&vvvv_d[i], 4);
                 break;
             }
 
@@ -4233,7 +4615,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 memcpy(vvvv_d, regs_.xmm[vex_vvvv & 15], 16);
                 memcpy(mask, regs_.xmm[mask_reg], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 for (int i = 0; i < 4; i++)
                     memcpy(regs_.xmm[reg] + i*4, (mask[i] & 0x80000000) ? (uint8_t*)&src[i] : (uint8_t*)&vvvv_d[i], 4);
                 break;
@@ -4251,7 +4633,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 memcpy(vvvv_q, regs_.xmm[vex_vvvv & 15], 16);
                 memcpy(mask, regs_.xmm[mask_reg], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 for (int i = 0; i < 2; i++)
                     memcpy(regs_.xmm[reg] + i*8, (mask[i] >> 63) ? (uint8_t*)&src[i] : (uint8_t*)&vvvv_q[i], 8);
                 break;
@@ -4268,7 +4650,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src[16], vvvv_b2[16];
                 memcpy(vvvv_b2, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 for (int i = 0; i < 16; i++)
                     regs_.xmm[reg][i] = (regs_.xmm[mask_reg][i] & 0x80) ? src[i] : vvvv_b2[i];
                 break;
@@ -4361,7 +4743,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 if (vex_opcode == 0x08) { // VROUNDPS
                     float src_f[4];
                     if (rm_is_reg) memcpy(src_f, regs_.xmm[(int)rm_addr & 15], 16);
-                    else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
+                    else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
                     for (int i = 0; i < 4; i++) {
                         if (mode == 0) src_f[i] = roundf(src_f[i]); // nearest
                         else if (mode == 1) src_f[i] = floorf(src_f[i]);
@@ -4378,7 +4760,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 } else if (vex_opcode == 0x09) { // VROUNDPD
                     double src_d[2];
                     if (rm_is_reg) memcpy(src_d, regs_.xmm[(int)rm_addr & 15], 16);
-                    else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_d, mem_base_ + off, 16); else memset(src_d, 0, 16); }
+                    else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_d, mem_base_ + off, 16); else memset(src_d, 0, 16); }
                     for (int i = 0; i < 2; i++) {
                         if (mode == 0) src_d[i] = round(src_d[i]); else if (mode == 1) src_d[i] = floor(src_d[i]);
                         else if (mode == 2) src_d[i] = ceil(src_d[i]); else src_d[i] = trunc(src_d[i]);
@@ -4404,7 +4786,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 float src_f[4], vvvv_f[4];
                 memcpy(vvvv_f, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src_f, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_f, mem_base_ + off, 16); else memset(src_f, 0, 16); }
                 float dp = 0;
                 for (int i = 0; i < 4; i++) if (imm & (1 << (i + 4))) dp += vvvv_f[i] * src_f[i];
                 float dst_f[4] = {0, 0, 0, 0};
@@ -4423,10 +4805,10 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 // We only support 128-bit lanes; imm=0 returns low, imm=1 returns zeros (no high lane)
                 if (imm & 1) {
                     if (rm_is_reg) memset(regs_.xmm[(int)rm_addr & 15], 0, 16);
-                    else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memset(mem_base_ + off, 0, 16); }
+                    else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memset(mem_base_ + off, 0, 16); }
                 } else {
                     if (rm_is_reg) memcpy(regs_.xmm[(int)rm_addr & 15], regs_.xmm[reg], 16);
-                    else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(mem_base_ + off, regs_.xmm[reg], 16); }
+                    else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(mem_base_ + off, regs_.xmm[reg], 16); }
                 }
                 break;
             }
@@ -4441,7 +4823,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint16_t src_w[8], vvvv_w[8];
                 memcpy(vvvv_w, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src_w, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src_w, mem_base_ + off, 16); else memset(src_w, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src_w, mem_base_ + off, 16); else memset(src_w, 0, 16); }
                 uint16_t dst_w[8];
                 for (int i = 0; i < 8; i++) dst_w[i] = (imm & (1 << i)) ? src_w[i] : vvvv_w[i];
                 memcpy(regs_.xmm[reg], dst_w, 16);
@@ -4458,12 +4840,72 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 uint8_t src[16], vvvv_b2[16];
                 memcpy(vvvv_b2, regs_.xmm[vex_vvvv & 15], 16);
                 if (rm_is_reg) memcpy(src, regs_.xmm[(int)rm_addr & 15], 16);
-                else { uint64_t off = rm_addr - mem_base_addr_; if (off + 16 <= mem_size_) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
+                else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 16)) memcpy(src, mem_base_ + off, 16); else memset(src, 0, 16); }
                 uint8_t concat[32];
                 memcpy(concat, src, 16);
                 memcpy(concat + 16, vvvv_b2, 16);
                 if (imm >= 32) memset(regs_.xmm[reg], 0, 16);
                 else { for (int i = 0; i < 16; i++) regs_.xmm[reg][i] = (imm + i < 32) ? concat[imm + i] : 0; }
+                break;
+            }
+
+            case 0x02: case 0x0D: {  // VPBLENDD (dwords) / VBLENDPD (qwords) by imm8 mask
+                uint8_t modrm = read_modrm();
+                int reg = reg_field(modrm);
+                uint64_t a; bool is_reg;
+                decode_rm(modrm, &a, &is_reg);
+                uint8_t imm = read_imm8();
+                uint8_t x[16], y[16];
+                memcpy(x, regs_.xmm[vex_vvvv & 15], 16);
+                ld(a, is_reg, y, 16);
+                const int esz = vex_opcode == 0x02 ? 4 : 8;
+                // The upper lane of a 256-bit blend uses the next mask bits.
+                const int shift = lane ? 16 / esz : 0;
+                for (int i = 0; i < 16 / esz; i++)
+                    memcpy(regs_.xmm[reg] + i * esz, ((imm >> (i + shift)) & 1) ? y + i * esz : x + i * esz, esz);
+                break;
+            }
+            case 0x1D: {  // VCVTPS2PH xmm/m64, xmm, imm8 (round to nearest even)
+                uint8_t modrm = read_modrm();
+                int reg = reg_field(modrm);
+                uint64_t a; bool is_reg;
+                decode_rm(modrm, &a, &is_reg);
+                read_imm8();
+                float f[4]; uint16_t h[4];
+                memcpy(f, regs_.xmm[reg], 16);
+                for (int i = 0; i < 4; i++) h[i] = FloatToHalf(f[i]);
+                if (is_reg) { memset(regs_.xmm[(int)a & 15], 0, 16); memcpy(regs_.xmm[(int)a & 15], h, 8); }
+                else if (Mapped(a, 8)) memcpy(mem_base_ + (a - mem_base_addr_), h, 8);
+                break;
+            }
+            case 0x41: {  // VDPPD
+                uint8_t modrm = read_modrm();
+                int reg = reg_field(modrm);
+                uint64_t a; bool is_reg;
+                decode_rm(modrm, &a, &is_reg);
+                uint8_t imm = read_imm8();
+                double x[2], y[2], out[2] = {0, 0}, dp = 0;
+                memcpy(x, regs_.xmm[vex_vvvv & 15], 16);
+                ld(a, is_reg, y, 16);
+                for (int i = 0; i < 2; i++) if (imm & (0x10 << i)) dp += x[i] * y[i];
+                for (int i = 0; i < 2; i++) if (imm & (1 << i)) out[i] = dp;
+                memcpy(regs_.xmm[reg], out, 16);
+                break;
+            }
+            case 0x44: {  // VPCLMULQDQ
+                uint8_t modrm = read_modrm();
+                int reg = reg_field(modrm);
+                uint64_t a; bool is_reg;
+                decode_rm(modrm, &a, &is_reg);
+                uint8_t imm = read_imm8();
+                uint64_t x[2], y[2];
+                memcpy(x, regs_.xmm[vex_vvvv & 15], 16);
+                ld(a, is_reg, y, 16);
+                uint64_t p = x[imm & 1], q = y[(imm >> 4) & 1], lo = 0, hi = 0;
+                for (int i = 0; i < 64; i++)
+                    if ((q >> i) & 1) { lo ^= p << i; if (i) hi ^= p >> (64 - i); }
+                uint64_t out[2] = {lo, hi};
+                memcpy(regs_.xmm[reg], out, 16);
                 break;
             }
 
@@ -4509,7 +4951,7 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 switch (vex_opcode) {
                     case 0x11: case 0x29: case 0x7F: case 0xD6: dest = op_rm_is_reg ? op_rm : -1; break;
                     case 0x13: case 0x17: case 0x2B: case 0xE7: case 0x2E: case 0x2F: case 0x50:
-                    case 0xD7: case 0xC5: case 0x2C: case 0x2D: dest = -1; break;
+                    case 0xD7: case 0xC5: case 0x2C: case 0x2D: case 0xAE: dest = -1; break;
                     case 0x7E: dest = vex_pp == 2 ? op_reg : -1; break;
                     case 0x71: case 0x72: case 0x73: dest = vex_vvvv; break;
                     default: break;
@@ -4518,6 +4960,8 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 if (vex_opcode >= 0xF0) dest = -1;
             } else if ((vex_opcode >= 0x14 && vex_opcode <= 0x17) || vex_opcode == 0xF0) {
                 dest = -1;
+            } else if (vex_opcode == 0x1D) {
+                dest = op_rm_is_reg ? op_rm : -1;
             }
             if (dest >= 0) memset(regs_.ymm_hi[dest & 15], 0, 16);
         }
