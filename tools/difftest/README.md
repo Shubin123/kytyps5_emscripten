@@ -6,14 +6,16 @@ instruction forms a game actually contains.
 1. `cases.py` disassembles the executable segments of the given ELFs (decrypted `eboot.bin` and
    `.prx` files), keeps one example of every instruction form (mnemonic plus operand kinds), and
    writes several cases per form, each with random registers, flags, `ymm0-15` and memory. Memory
-   operands, including RIP-relative ones, are pointed into a 1 MB scratch area.
+   operands, including RIP-relative ones, are pointed into a 1 MB scratch area. `VARIANTS=n` keeps
+   up to n encodings of each form (other registers, REX/VEX bits, addressing modes), which catches
+   bugs like a destination that is also a source.
 2. `real` runs every case on the host CPU: natively on x86-64 Linux, or under Rosetta 2 on Apple
    silicon. `interp` runs the same cases in `src/web/x86_interpreter.cpp`.
 3. `compare.py` reports every form whose registers, flags, vector registers, scratch memory or
    fault status differ. Flags the architecture leaves undefined are not compared.
 
 ```bash
-CASES=20 python3 tools/difftest/cases.py /tmp/cases.bin /tmp/forms.txt eboot.bin.esbak Module.prx.esbak
+VARIANTS=8 CASES=6 python3 tools/difftest/cases.py /tmp/cases.bin /tmp/forms.txt eboot.bin.esbak Module.prx.esbak
 clang -arch x86_64 -O1 tools/difftest/real.c tools/difftest/real_stub.S -o /tmp/real   # Linux: cc -O1 ...
 c++ -std=c++17 -O2 -Isrc/web/include tools/difftest/interp.cpp src/web/x86_interpreter.cpp -o /tmp/interp
 /tmp/real /tmp/cases.bin /tmp/real.bin

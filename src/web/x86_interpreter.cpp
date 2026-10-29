@@ -3987,14 +3987,18 @@ X86Exception X86Interpreter::DecodeAndExecute() {
                 int reg = reg_field(modrm) | (rex_r << 3);
                 uint64_t rm_addr; bool rm_is_reg;
                 decode_rm(modrm, &rm_addr, &rm_is_reg);
-                memcpy(regs_.xmm[reg], regs_.xmm[vex_vvvv & 15], 16);
-                if (vex_opcode == 0x16) {
-                    if (rm_is_reg) memcpy(regs_.xmm[reg] + 8, regs_.xmm[(int)rm_addr & 15], 8); // VMOVLHPS
-                    else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 8)) memcpy(regs_.xmm[reg] + 8, mem_base_ + off, 8); } // VMOVHPS load
+                // The second source is read before the destination is written: it may be the same register.
+                const bool high = vex_opcode == 0x16;  // into bits 127:64 (VMOVLHPS, VMOVHPS) or 63:0
+                uint8_t part[8];
+                bool have = true;
+                if (rm_is_reg) {
+                    memcpy(part, regs_.xmm[(int)rm_addr & 15] + (high ? 0 : 8), 8);  // VMOVLHPS, VMOVHLPS
                 } else {
-                    if (rm_is_reg) memcpy(regs_.xmm[reg], regs_.xmm[(int)rm_addr & 15] + 8, 8); // VMOVHLPS
-                    else { uint64_t off = rm_addr - mem_base_addr_; if (Mapped(rm_addr, 8)) memcpy(regs_.xmm[reg], mem_base_ + off, 8); } // VMOVLPS load
+                    have = Mapped(rm_addr, 8);  // VMOVHPS, VMOVLPS loads
+                    if (have) memcpy(part, mem_base_ + (rm_addr - mem_base_addr_), 8);
                 }
+                memcpy(regs_.xmm[reg], regs_.xmm[vex_vvvv & 15], 16);
+                if (have) memcpy(regs_.xmm[reg] + (high ? 8 : 0), part, 8);
                 break;
             }
 

@@ -9,6 +9,7 @@ from capstone.x86 import X86_OP_REG, X86_OP_MEM, X86_OP_IMM, X86_REG_RIP, X86_RE
 CODE, DATA, DATA_SIZE = 0x300000000, 0x300100000, 0x100000
 DATA_MID = DATA + DATA_SIZE // 2
 CASES_PER_FORM = int(__import__("os").environ.get("CASES", "6"))
+VARIANTS = int(__import__("os").environ.get("VARIANTS", "1"))
 SKIP = {'syscall', 'cpuid', 'rdtsc', 'rdtscp', 'xgetbv', 'ud2', 'hlt', 'int3', 'rdrand', 'rdseed', 'enter',
         'leave', 'xsave', 'xrstor', 'xsaveopt', 'xsavec', 'fxsave', 'fxrstor', 'rdpid', 'rdfsbase', 'rdgsbase',
         'wrfsbase', 'wrgsbase', 'cmpxchg16b', 'cmpxchg8b', 'pause'}
@@ -67,7 +68,12 @@ def sample_forms(paths):
                     continue  # gathers
                 if any(o.mem.base == X86_REG_INVALID and o.mem.index == X86_REG_INVALID for o in mems): continue
                 key = form_key(md, ins)
-                if key not in forms: forms[key] = ins
+                # Encodings of a form differ in prefixes, REX/VEX register bits, ModRM and SIB: keep up to
+                # VARIANTS of them, told apart by the bytes before any displacement or immediate.
+                cut = min([o for o, n in ((ins.disp_offset, ins.disp_size), (ins.imm_offset, ins.imm_size)) if n and o]
+                          or [len(raw)])
+                variants = forms.setdefault(key, OrderedDict())
+                if len(variants) < VARIANTS and raw[:cut] not in variants: variants[raw[:cut]] = ins
     return md, forms
 
 def rand_value(rng, kind):
@@ -121,11 +127,14 @@ def main():
     out, forms_out, paths = sys.argv[1], sys.argv[2], sys.argv[3:]
     md, forms = sample_forms(paths)
     rng = random.Random(1234)
+    count = 0
     with open(out, 'wb') as f, open(forms_out, 'w') as ff:
-        for key, ins in forms.items():
-            for rec in make_cases(md, ins, rng):
-                f.write(rec)
-            ff.write(f'{key}\t{bytes(ins.bytes).hex()}\t{ins.mnemonic} {ins.op_str}\n')
-    print(f'{len(forms)} forms, {len(forms) * CASES_PER_FORM} cases')
+        for key, variants in forms.items():
+            for ins in variants.values():
+                for rec in make_cases(md, ins, rng):
+                    f.write(rec)
+                ff.write(f'{key}\t{bytes(ins.bytes).hex()}\t{ins.mnemonic} {ins.op_str}\n')
+                count += 1
+    print(f'{len(forms)} forms in {count} encodings, {count * CASES_PER_FORM} cases')
 
 main()
